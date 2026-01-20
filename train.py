@@ -42,7 +42,6 @@ import src.preprocess_tcga_luad_with_clam as slic_tool
 from src.tcga_clinical import TCGAClinicalTable, slide_id_from_path, slide_to_case_id
 from src.loader import build_case_split_dataloaders
 from src.utils import  Logger, same_seeds
-from src.sr_diffusion_trainer import SRTrainConfig, DiffusionSRControlNetTrainer
 
 
 if __name__ == "__main__":
