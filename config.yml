@@ -1,121 +1,122 @@
-trainer:
-  batch_size: 8
-  lr: 1e-4
-  alpha: 0.4
-  bag_batch_size: 8
-  mil_hw: 28
-  max_train_batches: 2000
-  max_train_eval_batches: 400  
-  flip_event: false
-  use_amp: true
+# config.yml (clean & SR-focused)
 
-valer:
-  ckpt_tag: best          # best / latest
-  max_batches: 10         # validate 抽样 batch 数
+# 用于日志目录命名：logs/<checkpoint><timestamp>/
+checkpoint: "INR_Saliency_SR_v3"
 
-  do_val: true
-  do_test: true
-
-  do_dir_infer: true
-  eval_output_dir: ./outputs/sr_controlnet/eval
-  infer_lr_root: /mnt/liangjm/SpRR_data/lr_png/TCGA-05-4244-01Z-00-DX1
-  infer_hr_root: /mnt/liangjm/SpRR_data/hr_png/TCGA-05-4244-017-00-DX1   # 可选：用于复制HR对照
-  infer_disc_map_root: /mnt/liangjm/SpRR_data/disc_maps/TCGA-05-4244-017-00-DX1  
-  infer_out: ./outputs/sr_controlnet/eval_infer/TCGA-05-4244-017-00-DX1
-  infer_steps: 20
-  infer_limit: 50      
-  save_control: true
-  save_dino_energy: true
-  save_disc_map: true
-
-do_dir_infer: false
-
-checkpoint: TryFirst
-
-data_loader:
-  out_img_dir: /mnt/liangjm/SpRR_data/
-  max_patches_per_bag: 100
-  use_sr_png: false   
-  train_ratio: 0.7
-  val_ratio: 0.1
-  test_ratio: 0.2
-  patch_num: 300  # 每个 WSI 切取的 patch 数量，限制h5导出png数量(patch-num + 200)
-  num_workers: 0
-  pin_memory: False
-  seed: 2025
-  # CLAM for WSI 切片参数
-  patch_size: 512
-  step_size: 512
-  down_scale: 4   # 设定 LR 较之 HR 的缩放比例
-  min_tissue_ratio: 0.8 # 设定切片时的最小组织比例
-  patch_level: 0  # 设定切片时所用的层级, 0 通常是最高分辨率, 40x
-
-
-sr:
-  pretrained_sd15: runwayml/stable-diffusion-v1-5   # 或者本地路径 /mnt/liangjm/models/sd15
-  output_dir: ./outputs/sr_controlnet
-  token: hf_token
-  lr: 1e-5
-  train_steps: 50000
-  grad_accum: 1
-  mixed_precision: fp16
-  save_every: 1000
-  device: cuda
-
-  resume_ckpt: ""    # 例如 ./outputs/sr_controlnet/checkpoints/step_00002000
-  save_full_ckpt: true
-  val_vis_keep: 5    # 验证时保存多少张可视化图片
-
-  # disc 配置
-  disc:
-    generate_before_train: true
-    sam_ckpt: ./src/models/sam_vit_b_01ec64.pth
-    sam_model_type: vit_b
-    device: cuda
-    require_done: true
-    disc_root: ""     # 留空则默认 out_img_dir/disc_maps
-    max_items: -1     # -1 全量；调试可设 200
-    overwrite: false
-    log_every: 50
-
-  # vfm 配置
-  vfm:
-    name: dinov2
-    variant: dinov2_vitb14         # vitb14 / vitl14 / vitg14 
-    local_dir: ./src/models/dinov2_vitb14  # 离线本地路径
-    image_size: 518              
-    patch_size: 14                 # vitb14=14
-    control_mode: energy_edge_gray # 输出3通道如何组装
-    normalize: true
-    cache: false
-  
-    # VFM / DINOv2 co-training
-    vfm_unfreeze_last_blocks: 2
-    vfm_warmup_steps: 0
-    vfm_lr: 1e-6
-
-  # validation
-  val_every: 500        # 每多少 step 做一次验证
-  val_batches: 20       # 验证取多少个 batch
-  sample_steps: 20      # 采样(反推)步数：20先跑通，后续可调到30/50
-
-  # color correction 配置
-  enable_color_correction: True
-  color_correction_method: gain   # currently: reinhard
-  color_correction_ref: lr            
-  color_lowpass_ksize: 51              
-
-
-
-# You can set your dataset configurations here
+# -----------------------
+# Dataset roots (for CLAM slicing/export)
+# train.py 会构建 image_dict 并调用 slic_tool.run_clam_and_export
+# -----------------------
 TCGA_LUAD:
-  root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-LUAD/
+  root: "/mnt/lwx/pyworkspace/multi-sur/data/TCGA-LUAD/"
   choose_WSI: 50
 
 TCGA_KIRC:
-  root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-KIRC/
+  root: "/mnt/lwx/pyworkspace/multi-sur/data/TCGA-KIRC/"
   choose_WSI: 50
 
 TCGA_LIHC:
-  root: /mnt/lwx/pyworkspace/multi-sur/data/TCGA-LIHC/
+  root: "/mnt/lwx/pyworkspace/multi-sur/data/TCGA-LIHC/"
   choose_WSI: 50
+
+# -----------------------
+# Data loader / preprocessing settings
+# 这些字段在 train.py 中被直接读取
+# -----------------------
+data_loader:
+  # 输出目录（必须符合你的 loader.py 读取约定）
+  # out_img_dir/
+  #   hr_png/<slide_id>/patch_xxx.png
+  #   lr_png/<slide_id>/patch_xxx.png
+  #   clinical.tsv
+  out_img_dir: "/mnt/liangjm/SpRR_data/"
+
+  # CLAM 切片导出参数
+  patch_size: 512
+  step_size: 512
+  patch_level: 0
+  down_scale: 4
+  min_tissue_ratio: 0.5
+
+  # 数据加载
+  num_workers: 8
+  pin_memory: true
+
+  # 控制随机性 & split
+  seed: 2025
+  patch_num: 200         # build_case_split_dataloaders 用于每个 slide/case 抽样 patch 数（按你 loader 实现）
+  train_ratio: 0.7
+  val_ratio: 0.1
+  test_ratio: 0.2
+
+  skip_slicing: false
+
+# -----------------------
+# Model settings (INR + DINOv2 saliency guidance)
+# train.py 会用这些超参构建 SRModelConfig / SRModel
+# -----------------------
+model:
+  use_hovernet_guidance: true
+  hovernet_pretrained_name: "hgsc_v1_efficientnet_b5"
+  hovernet_use_gray: true
+  hovernet_mix_beta: 0.5
+  hovernet_weight_alpha: 1.0
+  feat_ch: 64
+  pe_bands: 10
+  mlp_hidden: 256
+  mlp_depth: 5
+
+  kernel_size: 7
+
+  num_points: 4096
+  saliency_ratio: 0.7
+  loss_alpha: 3.0
+
+  lambda_grad: 0.2
+  grad_crop: 128
+
+  infer_chunk: 8192
+
+  use_dino_saliency: true
+  dino_hf_dir: "src/models/dinov2_vitb14"
+
+  kernel_allow_negative: true
+
+  # mixed saliency
+  saliency_mix_beta: 0.4     # 0.3~0.5 推荐
+
+  # residual SR
+  use_residual: true
+  use_res_refiner: true     # 先 false，稳定后再 true
+
+  # temperature annealing
+  tau_start: 1.0
+  tau_end: 0.5
+  tau_warm_epochs: 2
+  tau_anneal_epochs: 8
+
+
+# -----------------------
+# Trainer settings
+# -----------------------
+trainer:
+  epochs: 50
+  batch_size: 8
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  log_every: 50
+  use_amp: true
+
+# -----------------------
+# Validation / checkpoint / visualization
+# -----------------------
+validator:
+  do_val: true
+  max_batches: -1            # -1 表示验证集全跑；若只想抽样验证可设为正数
+  metric_for_best: "lpips"    # 你也可以改成 "lpips"（注意 best 方向相反）
+  best_mode: "min"           # psnr/ssim -> max；lpips -> min
+
+  # 每轮验证保存一张随机可视化：HR / LR_up / SR 拼接图
+  save_vis: true
+  vis_subdir: "val_vis"
