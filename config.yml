@@ -1,5 +1,5 @@
 # 用于日志目录命名：logs/<checkpoint>_<timestamp>/
-checkpoint: "INR_SR_Scheme2_v4"
+checkpoint: "INR_SR_Scheme2_v5"
 
 # -----------------------
 # Dataset roots (for CLAM slicing/export)
@@ -71,7 +71,7 @@ model:
   loss_alpha: 3.0
 
   # residual SR
-  use_residual: true
+  use_residual: false
   use_res_refiner: true
 
   # structure / gradient consistency（你提过要引入结构梯度一致性）
