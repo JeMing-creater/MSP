@@ -5,7 +5,7 @@ import yaml
 import random
 from datetime import datetime
 from pathlib import Path
-
+os.environ['CUDA_VISIBLE_DEVICES'] = "2"
 import numpy as np
 import torch
 import torch.nn.functional as F
