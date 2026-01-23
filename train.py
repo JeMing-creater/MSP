@@ -46,59 +46,35 @@ def now_str():
 # ----------------------
 def build_model_and_optim(config: EasyDict, device: torch.device):
     """
-    Build SRModel + optimizer using the NEW model.py:
-      - NO DINO
-      - HoVer-Net guidance supported
+    Build SRModel + optimizer.
+    关键：只把 config.model 中 SRModelConfig 真正支持的字段传进去，
+    自动过滤旧参数/多余参数，避免“unexpected keyword argument”。
     """
-    mcfg = SRModelConfig(
-        # scale
-        scale=int(cfg_get(config, "data_loader.down_scale", 4)),
+    import dataclasses
+    from torch.optim import AdamW
 
-        # encoder & kernel predictor
-        feat_ch=int(cfg_get(config, "model.feat_ch", 64)),
-        pe_bands=int(cfg_get(config, "model.pe_bands", 10)),
-        mlp_hidden=int(cfg_get(config, "model.mlp_hidden", 256)),
-        mlp_depth=int(cfg_get(config, "model.mlp_depth", 5)),
+    # 1) 收集 SRModelConfig 的合法字段
+    valid_fields = {f.name for f in dataclasses.fields(SRModelConfig)}
 
-        # kernel
-        kernel_size=int(cfg_get(config, "model.kernel_size", 7)),
-        kernel_allow_negative=bool(cfg_get(config, "model.kernel_allow_negative", True)),
+    # 2) 从 config.model 读取参数（没有就给空 dict）
+    model_cfg = {}
+    if hasattr(config, "model") and isinstance(config.model, (dict, EasyDict)):
+        model_cfg = dict(config.model)
 
-        # sampling & weighting
-        num_points=int(cfg_get(config, "model.num_points", 4096)),
-        saliency_ratio=float(cfg_get(config, "model.saliency_ratio", 0.7)),
-        loss_alpha=float(cfg_get(config, "model.loss_alpha", 3.0)),
+    # 3) 强制写入 scale（通常来自 down_scale）
+    model_cfg["scale"] = int(cfg_get(config, "data_loader.down_scale", 4))
 
-        # residual SR
-        use_residual=bool(cfg_get(config, "model.use_residual", True)),
-        use_res_refiner=bool(cfg_get(config, "model.use_res_refiner", False)),
+    # 4) 过滤掉 SRModelConfig 不认识的字段
+    filtered = {k: v for k, v in model_cfg.items() if k in valid_fields}
 
-        # gradient consistency
-        lambda_grad=float(cfg_get(config, "model.lambda_grad", 0.2)),
-        grad_crop=int(cfg_get(config, "model.grad_crop", 128)),
-
-        # inference chunk
-        infer_chunk=int(cfg_get(config, "model.infer_chunk", 8192)),
-
-        # HoVer-Net guidance (NEW)
-        use_hovernet_guidance=bool(cfg_get(config, "model.use_hovernet_guidance", False)),
-        hovernet_pretrained_name=str(cfg_get(config, "model.hovernet_pretrained_name", "cin2_v1_efficientnet_b5")),
-        hovernet_use_gray=bool(cfg_get(config, "model.hovernet_use_gray", True)),
-        hovernet_mix_beta=float(cfg_get(config, "model.hovernet_mix_beta", 0.5)),
-        hovernet_weight_alpha=float(cfg_get(config, "model.hovernet_weight_alpha", 1.0)),
-
-        # temperature annealing
-        tau_start=float(cfg_get(config, "model.tau_start", 1.0)),
-        tau_end=float(cfg_get(config, "model.tau_end", 0.5)),
-        tau_warm_epochs=int(cfg_get(config, "model.tau_warm_epochs", 2)),
-        tau_anneal_epochs=int(cfg_get(config, "model.tau_anneal_epochs", 8)),
-    )
-
+    # 5) 构建模型
+    mcfg = SRModelConfig(**filtered)
     model = SRModel(cfg=mcfg).to(device)
 
+    # 6) Optimizer
     lr = float(cfg_get(config, "trainer.lr", 1e-4))
     wd = float(cfg_get(config, "trainer.weight_decay", 1e-4))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
     scheduler = None
     return model, optimizer, scheduler
@@ -219,11 +195,21 @@ def save_random_train_visual_to_val_vis(
 # ----------------------
 def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, epoch: int, config: EasyDict):
     model.train()
-    running = 0.0
-    step = 0
+
+    # 若模型内部有 tau / epoch schedule
+    if hasattr(model, "set_epoch") and callable(getattr(model, "set_epoch")):
+        try:
+            model.set_epoch(epoch)
+        except Exception:
+            pass
 
     log_every = int(cfg_get(config, "trainer.log_every", 50))
     grad_clip = cfg_get(config, "trainer.grad_clip", None)
+
+    run_total = 0.0
+    run_pix = 0.0
+    run_edge = 0.0
+    step = 0
 
     for batch in train_loader:
         lr = batch["lr"].to(accelerator.device, non_blocking=True)
@@ -232,6 +218,7 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
         optimizer.zero_grad(set_to_none=True)
 
         loss, dbg = model.compute_loss(lr, hr, return_debug=True)
+
         accelerator.backward(loss)
 
         if grad_clip is not None:
@@ -239,19 +226,45 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
 
         optimizer.step()
 
-        running += float(loss.detach().item())
+        # -------------------------
+        # 统计
+        # -------------------------
+        total = float(loss.detach().item())
+
+        pix = float(dbg.get("loss_pix", 0.0))
+        grad = float(dbg.get("loss_grad", 0.0))
+        fft = float(dbg.get("loss_fft", 0.0))
+
+        lam_g = float(dbg.get("lambda_grad", 0.0))
+        lam_f = float(dbg.get("lambda_fft", 0.0))
+
+        edge = lam_g * grad + lam_f * fft
+
+        run_total += total
+        run_pix += pix
+        run_edge += edge
         step += 1
 
-        if accelerator.is_local_main_process and (step % log_every == 0):
+        # -------------------------
+        # 打印
+        # -------------------------
+        if accelerator.is_local_main_process and step % log_every == 0:
+            avg_total = run_total / step
+            avg_pix = run_pix / step
+            avg_edge = run_edge / step
+
+            denom = max(avg_total, 1e-8)
+            pix_ratio = avg_pix / denom
+            edge_ratio = avg_edge / denom
+
             accelerator.print(
                 f"[Epoch {epoch}][{step}] "
-                f"loss={running/step:.4f} "
-                f"pix={dbg.get('loss_pix', 0):.4f} grad={dbg.get('loss_grad', 0):.4f} "
-                f"mix={dbg.get('mean_mix', 0):.3f} dino={dbg.get('mean_dino', 0):.3f} edge={dbg.get('mean_edge', 0):.3f} "
-                f"tau={dbg.get('tau', 1.0):.3f}"
+                f"total={total:.4f} (avg={avg_total:.4f}) | "
+                f"pix={pix:.4f} ({pix_ratio*100:.1f}%) | "
+                f"edge={edge:.4f} ({edge_ratio*100:.1f}%)"
             )
 
-    return running / max(step, 1)
+    return run_total / max(step, 1)
 
 
 @torch.no_grad()

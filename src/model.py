@@ -1,23 +1,17 @@
 # model.py
 # -*- coding: utf-8 -*-
 """
-SR model (non-diffusion, non-GAN):
-- Dynamic kernel prediction per HR pixel (local implicit SR)
-- Optional residual SR: SR = upsample(LR) + residual
-- Structure-aware sampling + loss reweighting using Cellpose nuclei masks (frozen guidance)
-- Optional gradient-consistency loss on HR crops
-- Kernel temperature annealing (tau schedule)
+SR core: Dynamic kernel prediction (non-generative) + optional residual.
+Boundary/detail constraint: FFT high-pass consistency loss (Scheme 2).
 
-Public interface expected by train.py:
-  - model = SRModel(cfg)
-  - sr = model(lr)                      # inference (no HR required)
-  - loss = model.compute_loss(lr, hr)   # training (HR required)
-  - model.set_epoch(epoch)              # optional
+External interface:
+  - model(lr) -> sr
+  - model.compute_loss(lr, hr, return_debug=False) -> loss (and debug dict)
+  - model.set_epoch(epoch) (optional)
 
-Dependencies (for guidance):
-  pip install cellpose
-Cellpose is used ONLY to produce a weight map W (boundary emphasis) from HR,
-and DOES NOT affect SR color generation directly.
+Notes:
+- Inference/validation without HR: just call model(lr).
+- FFT loss is computed ONLY inside compute_loss(lr, hr).
 """
 
 from __future__ import annotations
@@ -32,7 +26,7 @@ import torch.nn.functional as F
 
 
 # =============================================================================
-# Utilities
+# Utils
 # =============================================================================
 def _minmax_norm(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Per-sample min-max normalize to [0,1]. x: [B,1,H,W]."""
@@ -44,7 +38,7 @@ def _minmax_norm(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 
 def _rgb_to_gray(x: torch.Tensor) -> torch.Tensor:
-    """x: [B,3,H,W] in [0,1] -> [B,1,H,W]."""
+    """x: [B,3,H,W] -> [B,1,H,W]"""
     r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
     return 0.2989 * r + 0.5870 * g + 0.1140 * b
 
@@ -57,11 +51,27 @@ def _grad_mag_gray(x_gray: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(gx * gx + gy * gy + 1e-12)
 
 
+def _make_hr_int_grid(H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    ys = torch.arange(H, device=device)
+    xs = torch.arange(W, device=device)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    return torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1).to(dtype=dtype)
+
+
+def _hr_int_to_hr_norm(hr_xy_int: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    """(x,y) int -> normalized [-1,1] at pixel centers."""
+    x = hr_xy_int[:, 0].to(torch.float32)
+    y = hr_xy_int[:, 1].to(torch.float32)
+    x_norm = (x + 0.5) / float(W) * 2.0 - 1.0
+    y_norm = (y + 0.5) / float(H) * 2.0 - 1.0
+    return torch.stack([x_norm, y_norm], dim=1).to(dtype=torch.float32, device=hr_xy_int.device)
+
+
 def _image_grad_l1(sr: torch.Tensor, hr: torch.Tensor, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Gradient L1 between sr and hr (grayscale).
     sr/hr: [B,3,H,W] in [0,1]
-    weight: [B,1,H,W] optional, multiplies per-pixel gradient loss.
+    weight: [B,1,H,W] optional
     """
     sr_g = _rgb_to_gray(sr)
     hr_g = _rgb_to_gray(hr)
@@ -75,50 +85,118 @@ def _image_grad_l1(sr: torch.Tensor, hr: torch.Tensor, weight: Optional[torch.Te
     dy_l1 = (sr_dy - hr_dy).abs()
 
     if weight is not None:
-        w_dx = weight[:, :, :, :-1]
-        w_dy = weight[:, :, :-1, :]
-        dx_l1 = dx_l1 * w_dx
-        dy_l1 = dy_l1 * w_dy
+        dx_l1 = dx_l1 * weight[:, :, :, :-1]
+        dy_l1 = dy_l1 * weight[:, :, :-1, :]
 
     return dx_l1.mean() + dy_l1.mean()
 
 
-def _make_hr_int_grid(H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Return [N,2] integer HR pixel coords (x,y) for all pixels."""
-    ys = torch.arange(H, device=device)
-    xs = torch.arange(W, device=device)
-    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-    return torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1).to(dtype=dtype)
-
-
-def _hr_int_to_hr_norm(hr_xy_int: torch.Tensor, H: int, W: int) -> torch.Tensor:
-    """Convert HR integer coords (x,y) to normalized coords [-1,1] at pixel centers."""
-    x = hr_xy_int[:, 0].to(torch.float32)
-    y = hr_xy_int[:, 1].to(torch.float32)
-    x_norm = (x + 0.5) / float(W) * 2.0 - 1.0
-    y_norm = (y + 0.5) / float(H) * 2.0 - 1.0
-    return torch.stack([x_norm, y_norm], dim=1).to(dtype=torch.float32, device=hr_xy_int.device)
-
-
 def _get_points_rgb(img: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """img: [3,H,W] -> gather [N,3] by flattened idx"""
+    """img: [3,H,W] -> [N,3] by flattened idx"""
     return img.permute(1, 2, 0).reshape(-1, 3)[idx]
 
 
 def _get_points_map(map1: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """map1: [1,H,W] -> gather [N]"""
+    """map1: [1,H,W] -> [N]"""
     return map1.reshape(-1)[idx]
+
+
+def _fuse_keep_color(lr_up: torch.Tensor, sr_pred: torch.Tensor) -> torch.Tensor:
+    """
+    Hard color-preserving fusion (Scheme B).
+    Keep chroma/color from lr_up, inject only luminance/detail from sr_pred.
+
+    Implementation in RGB space using grayscale residual:
+      sr_final = lr_up + (gray(sr_pred) - gray(lr_up))  (broadcast to 3 channels)
+
+    lr_up, sr_pred: [B,3,H,W] in [0,1]
+    return: [B,3,H,W] in [0,1]
+    """
+    lr_g = _rgb_to_gray(lr_up)      # [B,1,H,W]
+    sr_g = _rgb_to_gray(sr_pred)    # [B,1,H,W]
+    delta = sr_g - lr_g             # luminance residual
+    sr_final = (lr_up + delta.repeat(1, 3, 1, 1)).clamp(0, 1)
+    return sr_final
+
+# =============================================================================
+# FFT high-pass loss
+# =============================================================================
+def _fft_highpass_mask(h: int, w: int, cutoff_ratio: float, device: torch.device) -> torch.Tensor:
+    """
+    Create a radial high-pass mask in frequency domain (fftshifted layout).
+    cutoff_ratio: in (0,0.5). Frequencies with radius >= cutoff are kept.
+    Returns mask [1,1,H,W] float.
+    """
+    cutoff_ratio = float(cutoff_ratio)
+    cutoff_ratio = max(0.0, min(0.5, cutoff_ratio))
+
+    yy = torch.arange(h, device=device).float()
+    xx = torch.arange(w, device=device).float()
+    Y, X = torch.meshgrid(yy, xx, indexing="ij")
+
+    cy = (h - 1) / 2.0
+    cx = (w - 1) / 2.0
+    r = torch.sqrt((Y - cy) ** 2 + (X - cx) ** 2)
+
+    # FIX: r_max should be float via math.sqrt (not torch.sqrt on floats)
+    r_max = math.sqrt(cy * cy + cx * cx) + 1e-6
+    r_norm = r / r_max
+
+    mask = (r_norm >= cutoff_ratio).float()
+    return mask.view(1, 1, h, w)
+
+
+def _fftshift2(x: torch.Tensor) -> torch.Tensor:
+    """2D fftshift for last two dims."""
+    h, w = x.shape[-2], x.shape[-1]
+    return torch.roll(torch.roll(x, shifts=h // 2, dims=-2), shifts=w // 2, dims=-1)
+
+
+def fft_highpass_l1(
+    sr: torch.Tensor,
+    hr: torch.Tensor,
+    cutoff_ratio: float = 0.15,
+    use_logmag: bool = True,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    SR/HR: [B,3,H,W] in [0,1]
+    Compute L1 distance between high-frequency magnitude spectra (grayscale).
+    """
+    sr_g = _rgb_to_gray(sr).clamp(0, 1)
+    hr_g = _rgb_to_gray(hr).clamp(0, 1)
+
+    # remove DC bias: improves stability
+    sr_g = sr_g - sr_g.mean(dim=(2, 3), keepdim=True)
+    hr_g = hr_g - hr_g.mean(dim=(2, 3), keepdim=True)
+
+    # fft2 -> complex
+    F_sr = torch.fft.fft2(sr_g, dim=(-2, -1))
+    F_hr = torch.fft.fft2(hr_g, dim=(-2, -1))
+
+    # shift to center
+    F_sr = _fftshift2(F_sr)
+    F_hr = _fftshift2(F_hr)
+
+    mag_sr = torch.abs(F_sr)
+    mag_hr = torch.abs(F_hr)
+
+    if use_logmag:
+        mag_sr = torch.log1p(mag_sr + eps)
+        mag_hr = torch.log1p(mag_hr + eps)
+
+    B, _, H, W = mag_sr.shape
+    mask = _fft_highpass_mask(H, W, cutoff_ratio=cutoff_ratio, device=mag_sr.device)  # [1,1,H,W]
+
+    diff = (mag_sr - mag_hr).abs() * mask
+    denom = mask.mean().clamp_min(1e-6)
+    return diff.mean() / denom
 
 
 # =============================================================================
 # Positional Encoding
 # =============================================================================
 class FourierPositionalEncoding(nn.Module):
-    """
-    Fourier features for 2D coords (x,y) in [-1,1]:
-      [sin(2^k*pi*x), cos(2^k*pi*x), sin(2^k*pi*y), cos(2^k*pi*y)]_{k=0..K-1}
-    """
-
     def __init__(self, num_bands: int = 10):
         super().__init__()
         self.num_bands = int(num_bands)
@@ -165,10 +243,8 @@ class LocalEncoder(nn.Module):
 # =============================================================================
 class KernelMLP(nn.Module):
     """
-    Predict KxK kernel logits for each queried HR point.
     input = [local_feat(center), PE(hr_xy_norm), lr_frac(dx,dy)] -> kernel_logits (K*K)
     """
-
     def __init__(
         self,
         feat_dim: int,
@@ -193,16 +269,14 @@ class KernelMLP(nn.Module):
 
 
 # =============================================================================
-# Optional residual head (tiny CNN)
+# Optional residual refiner (color-safe groups=3)
 # =============================================================================
 class ResidualRefiner(nn.Module):
     """
     Color-safe refiner (no cross-channel mixing):
-    - groups=3 so each channel (R/G/B) is processed independently.
-    - input channels are 6: [lr_up_rgb, res0_rgb]
-      3 groups, each group has 2 channels: (lr_up_c, res0_c)
+    groups=3 so each channel processed independently.
+    input channels 6: [lr_up_rgb, res0_rgb] -> output residual RGB
     """
-
     def __init__(self, ch_per_group: int = 16):
         super().__init__()
         hidden = 3 * int(ch_per_group)
@@ -220,149 +294,10 @@ class ResidualRefiner(nn.Module):
 
 
 # =============================================================================
-# Cellpose guidance (stable)
-# =============================================================================
-class CellposeGuidance(nn.Module):
-    """
-    Use Cellpose (frozen) to produce a structural weight map W_cp in [0,1].
-    - Run on HR only (during training/validation when HR is available).
-    - DOES NOT backprop through Cellpose.
-    - Output is boundary-emphasis derived from instance masks.
-
-    Typical call:
-      W = guidance(hr)  # hr: [B,3,H,W] in [0,1]
-    """
-
-    def __init__(
-        self,
-        model_type: str = "nuclei",
-        use_gpu_if_available: bool = True,
-        channels: Tuple[int, int] = (0, 0),
-        diameter: float = 0.0,   # 0.0 = auto in cellpose
-        use_gray: bool = True,   # recommended for H&E guidance stability
-        max_side: int = 1024,    # downscale large HR for speed; then upscale masks back
-    ):
-        super().__init__()
-        self.model_type = str(model_type)
-        self.use_gpu_if_available = bool(use_gpu_if_available)
-        self.channels = tuple(channels)
-        self.diameter = float(diameter)
-        self.use_gray = bool(use_gray)
-        self.max_side = int(max_side)
-
-        self._cp = None
-        self._ready = False
-
-    def _lazy_build(self, device: torch.device):
-        if self._ready:
-            return
-        try:
-            from cellpose import models  # type: ignore
-        except Exception as e:
-            raise ImportError(
-                "Cellpose is required for CellposeGuidance.\n"
-                "Install:\n  pip install cellpose\n"
-                f"Original error: {e}"
-            )
-
-        gpu_flag = bool(self.use_gpu_if_available and device.type == "cuda")
-        self._cp = models.CellposeModel(gpu=gpu_flag, model_type=self.model_type)
-        self._ready = True
-
-    @staticmethod
-    def _morph_boundary_from_mask(mask01: torch.Tensor) -> torch.Tensor:
-        """
-        mask01: [1,1,H,W] float 0/1
-        return: boundary [1,1,H,W] float [0,1]
-        """
-        dil = F.max_pool2d(mask01, 3, 1, 1)
-        ero = -F.max_pool2d(-mask01, 3, 1, 1)
-        boundary = (dil - ero).clamp(0, 1)
-        # normalize
-        boundary = boundary / (boundary.max() + 1e-6)
-        return boundary
-
-    @torch.no_grad()
-    def forward(self, hr_01: torch.Tensor) -> torch.Tensor:
-        """
-        hr_01: [B,3,H,W] float in [0,1]
-        return: W_cp [B,1,H,W] float in [0,1]
-        """
-        if hr_01.ndim != 4 or hr_01.shape[1] != 3:
-            raise ValueError(f"hr must be [B,3,H,W], got {tuple(hr_01.shape)}")
-
-        device = hr_01.device
-        self._lazy_build(device)
-        assert self._cp is not None
-
-        B, _, H, W = hr_01.shape
-        out_ws: List[torch.Tensor] = []
-
-        # Process per-image (Cellpose API expects numpy)
-        for b in range(B):
-            x = hr_01[b].detach().clamp(0, 1)
-
-            # optional grayscale guidance for stability (does NOT affect SR colors)
-            if self.use_gray:
-                xg = _rgb_to_gray(x.unsqueeze(0)).squeeze(0)  # [1,H,W]
-                # cellpose accepts HxW or HxWx3; we pass HxW float
-                im_np = xg.squeeze(0).float().cpu().numpy()
-            else:
-                # HWC RGB float
-                im_np = x.permute(1, 2, 0).float().cpu().numpy()
-
-            # optional downscale for speed; upscale boundary back
-            orig_hw = (H, W)
-            work_hw = (H, W)
-            if self.max_side > 0:
-                m = max(H, W)
-                if m > self.max_side:
-                    scale = self.max_side / float(m)
-                    Hs = max(32, int(round(H * scale)))
-                    Ws = max(32, int(round(W * scale)))
-                    work_hw = (Hs, Ws)
-                    # resize via torch for consistency
-                    if self.use_gray:
-                        tmp = torch.from_numpy(im_np)[None, None].to(device=device, dtype=torch.float32)
-                        tmp = F.interpolate(tmp, size=work_hw, mode="bilinear", align_corners=False)
-                        im_np = tmp[0, 0].cpu().numpy()
-                    else:
-                        tmp = torch.from_numpy(im_np).permute(2, 0, 1)[None].to(device=device, dtype=torch.float32)
-                        tmp = F.interpolate(tmp, size=work_hw, mode="bilinear", align_corners=False)
-                        im_np = tmp[0].permute(1, 2, 0).cpu().numpy()
-
-            # run cellpose
-            # returns masks as HxW with instance ids (0=background)
-            masks, flows, styles, diams = self._cp.eval(
-                im_np,
-                channels=list(self.channels),
-                diameter=(None if self.diameter <= 0 else self.diameter),
-                normalize=True,
-            )
-
-            # masks -> foreground binary
-            import numpy as np  # local import
-            fg = (masks.astype(np.int32) > 0).astype(np.float32)  # HxW
-
-            mask_t = torch.from_numpy(fg)[None, None].to(device=device, dtype=torch.float32)  # [1,1,Hs,Ws]
-            boundary = self._morph_boundary_from_mask(mask_t)  # [1,1,Hs,Ws]
-
-            # resize back to original HR
-            if work_hw != orig_hw:
-                boundary = F.interpolate(boundary, size=orig_hw, mode="bilinear", align_corners=False)
-
-            out_ws.append(boundary)
-
-        W_cp = torch.cat(out_ws, dim=0).clamp(0, 1)  # [B,1,H,W]
-        return W_cp
-
-
-# =============================================================================
 # Config
 # =============================================================================
 @dataclass
 class SRModelConfig:
-    # scaling
     scale: int = 4
 
     # encoder & kernel predictor
@@ -373,23 +308,27 @@ class SRModelConfig:
 
     # kernel prediction
     kernel_size: int = 7  # odd
-    kernel_allow_negative: bool = True
 
     # training sampling
     num_points: int = 4096
     saliency_ratio: float = 0.7
-    loss_alpha: float = 3.0
+    loss_alpha: float = 3.0  # pixel-weight strength using W_edge
 
     # gradient consistency
     lambda_grad: float = 0.2
     grad_crop: int = 128
 
+    # FFT high-pass consistency (Scheme 2)
+    lambda_fft: float = 0.15
+    fft_crop: int = 256              # compute FFT on a random crop for speed
+    fft_cutoff_ratio: float = 0.15   # higher => only very high frequencies
+    fft_use_logmag: bool = True
+
     # inference chunking
     infer_chunk: int = 8192
 
-    # residual SR
-    use_residual: bool = True
-    use_res_refiner: bool = False
+    # kernel weight mode
+    kernel_allow_negative: bool = True
 
     # temperature annealing (tau)
     tau_start: float = 1.0
@@ -397,31 +336,15 @@ class SRModelConfig:
     tau_warm_epochs: int = 2
     tau_anneal_epochs: int = 8
 
-    # Cellpose guidance
-    use_cellpose_guidance: bool = True
-    cellpose_model_type: str = "nuclei"
-    cellpose_use_gray: bool = True
-    cellpose_channels0: int = 0   # channels=[c0,c1] for cellpose; for grayscale use [0,0]
-    cellpose_channels1: int = 0
-    cellpose_diameter: float = 0.0
-    cellpose_max_side: int = 1024
-
-    # mix guidance with edge saliency
-    cellpose_mix_beta: float = 0.6          # W_mix = beta*W_cp + (1-beta)*W_edge
-    cellpose_weight_alpha: float = 1.0      # additional scaling on W_cp
+    # residual SR
+    use_residual: bool = True
+    use_res_refiner: bool = False
 
 
 # =============================================================================
-# Main SR model
+# Main SR Model
 # =============================================================================
 class SRModel(nn.Module):
-    """
-    Exposed:
-      - forward(lr)->sr
-      - compute_loss(lr,hr)->loss
-      - set_epoch(epoch) (optional)
-    """
-
     def __init__(self, cfg: Optional[SRModelConfig] = None):
         super().__init__()
         self.cfg = cfg or SRModelConfig()
@@ -442,25 +365,12 @@ class SRModel(nn.Module):
 
         self.res_refiner = ResidualRefiner() if self.cfg.use_res_refiner else None
 
-        # guidance (lazy inside)
-        self._cp = CellposeGuidance(
-            model_type=self.cfg.cellpose_model_type,
-            use_gpu_if_available=True,
-            channels=(int(self.cfg.cellpose_channels0), int(self.cfg.cellpose_channels1)),
-            diameter=float(self.cfg.cellpose_diameter),
-            use_gray=bool(self.cfg.cellpose_use_gray),
-            max_side=int(self.cfg.cellpose_max_side),
-        )
-
-        # precompute K*K offsets in LR pixel units
+        # kernel offsets (K*K)
         r = self.cfg.kernel_size // 2
-        offsets = []
-        for oy in range(-r, r + 1):
-            for ox in range(-r, r + 1):
-                offsets.append((ox, oy))
+        offsets = [(ox, oy) for oy in range(-r, r + 1) for ox in range(-r, r + 1)]
         self.register_buffer("_kernel_offsets", torch.tensor(offsets, dtype=torch.float32), persistent=False)
 
-        # temperature state
+        # tau state
         self._epoch = 0
         self._tau = float(self.cfg.tau_start)
 
@@ -484,46 +394,18 @@ class SRModel(nn.Module):
         return (1.0 - t) * s + t * e
 
     # ----------------------------
-    # saliency / guidance
+    # edge saliency (from LR-up)
     # ----------------------------
     @torch.no_grad()
-    def compute_mixed_saliency(
-        self,
-        lr: torch.Tensor,
-        hr: torch.Tensor,
-        out_hw: Tuple[int, int],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          W_mix: [B,1,H,W] mixed weight
-          W_cp : [B,1,H,W] Cellpose boundary weight (zeros if disabled)
-          W_edge:[B,1,H,W] edge weight from LR-upsample
-        """
+    def compute_edge_saliency(self, lr: torch.Tensor, out_hw: Tuple[int, int]) -> torch.Tensor:
         H_hr, W_hr = out_hw
         lr_up = F.interpolate(lr, size=(H_hr, W_hr), mode="bicubic", align_corners=False).clamp(0, 1)
-
-        # edge saliency from lr_up
         g = _rgb_to_gray(lr_up)
         W_edge = _minmax_norm(_grad_mag_gray(g))
-
-        W_cp = torch.zeros_like(W_edge)
-        if bool(self.cfg.use_cellpose_guidance):
-            # try:
-            W_cp = self._cp(hr.detach().clamp(0, 1))
-            # except Exception:
-            #     # fallback silently: keep zeros to not break training
-            #     W_cp = torch.zeros_like(W_edge)
-
-        alpha = float(getattr(self.cfg, "cellpose_weight_alpha", 1.0))
-        if alpha != 1.0:
-            W_cp = (alpha * W_cp).clamp(0, 1)
-
-        beta = float(getattr(self.cfg, "cellpose_mix_beta", 0.6))
-        W_mix = (beta * W_cp + (1.0 - beta) * W_edge).clamp(0, 1)
-        return W_mix, W_cp, W_edge
+        return W_edge
 
     # ----------------------------
-    # coord mapping
+    # coord mapping HR -> LR continuous
     # ----------------------------
     def _lr_continuous_from_hr_int(
         self,
@@ -563,7 +445,6 @@ class SRModel(nn.Module):
         K = offsets.shape[0]
 
         xy = lr_xy_cont.unsqueeze(1) + offsets.unsqueeze(0)  # [N,K,2]
-
         x_norm = (xy[..., 0] + 0.5) / float(W_lr) * 2.0 - 1.0
         y_norm = (xy[..., 1] + 0.5) / float(H_lr) * 2.0 - 1.0
         grid = torch.stack([x_norm, y_norm], dim=-1)  # [N,K,2]
@@ -574,26 +455,20 @@ class SRModel(nn.Module):
         return samp
 
     # ----------------------------
-    # kernel weights + temperature
+    # kernel weights with tau
     # ----------------------------
     def _kernel_weights_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """
-        logits: [B,N,K]
-        Apply temperature: logits / tau
-        Then produce weights (allow negative if configured).
-        """
         tau = float(self._tau)
         logits = logits / max(tau, 1e-6)
 
-        if not bool(self.cfg.kernel_allow_negative):
+        if not self.cfg.kernel_allow_negative:
             return torch.softmax(logits, dim=-1)
 
-        # allow negative but keep normalization; avoid inplace ops
-        w = torch.tanh(logits)  # [B,N,K]
+        w = torch.tanh(logits)  # no inplace
         K = w.shape[-1]
         center = K // 2
-        oh = F.one_hot(torch.tensor(center, device=w.device), num_classes=K).to(w.dtype)  # [K]
-        w = w + oh.view(1, 1, K)
+        oh = F.one_hot(torch.tensor(center, device=w.device), num_classes=K).to(w.dtype)
+        w = w + oh.view(1, 1, K)  # add identity bias
         w = w / (w.sum(dim=-1, keepdim=True) + 1e-6)
         return w
 
@@ -613,15 +488,15 @@ class SRModel(nn.Module):
         cen = cen.squeeze(2).transpose(1, 2).contiguous()  # [B,N,C]
 
         pe = self.pe(hr_xy_norm.to(device=feat_lr.device, dtype=torch.float32))  # [N,pe_dim]
-        pe = pe.unsqueeze(0).expand(B, -1, -1)  # [B,N,pe_dim]
-        frac = lr_frac.to(device=feat_lr.device, dtype=torch.float32).unsqueeze(0).expand(B, -1, -1)  # [B,N,2]
+        pe = pe.unsqueeze(0).expand(B, -1, -1)
+        frac = lr_frac.to(device=feat_lr.device, dtype=torch.float32).unsqueeze(0).expand(B, -1, -1)
 
         inp = torch.cat([cen, pe, frac], dim=-1)  # [B,N,D]
         logits = self.kernel_mlp(inp.view(B * N, -1)).view(B, N, K)
         return self._kernel_weights_from_logits(logits)
 
     # ----------------------------
-    # point prediction (base SR from kernel)
+    # point prediction
     # ----------------------------
     def predict_points_base(
         self,
@@ -631,8 +506,8 @@ class SRModel(nn.Module):
         feat_lr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Predict base SR at points using dynamic kernel.
-        Returns sr_base [B,N,3] in [0,1]
+        Base SR at points using dynamic kernel.
+        Returns [B,N,3] in [0,1]
         """
         B, _, H_lr, W_lr = lr.shape
         H_hr, W_hr = hr_hw
@@ -650,11 +525,11 @@ class SRModel(nn.Module):
         offsets = self._kernel_offsets.to(device=lr.device, dtype=torch.float32)
         rgb = self._sample_lr_rgb_neighbors(lr, lr_xy_cont, offsets)  # [B,N,K,3]
 
-        sr_base = (w.unsqueeze(-1) * rgb).sum(dim=2).clamp(0, 1)  # [B,N,3]
+        sr_base = (w.unsqueeze(-1) * rgb).sum(dim=2).clamp(0, 1)
         return sr_base
 
     # ----------------------------
-    # full image SR (inference)
+    # full SR image (inference)
     # ----------------------------
     @torch.no_grad()
     def super_resolve(self, lr: torch.Tensor, out_hw: Optional[Tuple[int, int]] = None) -> torch.Tensor:
@@ -678,72 +553,63 @@ class SRModel(nn.Module):
                 hr_xy_int=hr_xy_int_full[st:ed],
                 hr_hw=(H_hr, W_hr),
                 feat_lr=feat_lr,
-            )  # [B,chunk,3]
+            )
             outs.append(sr_pts)
 
         sr_base = torch.cat(outs, dim=1).transpose(1, 2).contiguous().view(B, 3, H_hr, W_hr).clamp(0, 1)
 
-        if not bool(self.cfg.use_residual):
-            return sr_base
-
-        res0 = (sr_base - lr_up)
-        if self.res_refiner is not None:
-            res = self.res_refiner(lr_up, res0)
+        # --- Scheme B: hard color-preserving fusion ---
+        # if use_residual: still allow residual/refiner to enhance details, but final output is fused.
+        if self.cfg.use_residual:
+            res0 = sr_base - lr_up
+            if self.res_refiner is not None:
+                res = self.res_refiner(lr_up, res0)
+            else:
+                res = res0
+            sr_pred = (lr_up + res).clamp(0, 1)
         else:
-            res = res0
+            sr_pred = sr_base
 
-        sr = (lr_up + res).clamp(0, 1)
-        return sr
+        # Final: keep color from lr_up, inject only luminance residual from sr_pred
+        sr_final = _fuse_keep_color(lr_up, sr_pred)
+        return sr_final
 
     def forward(self, lr: torch.Tensor) -> torch.Tensor:
-        # inference does not require HR
         return self.super_resolve(lr, out_hw=None)
 
     # ----------------------------
     # training loss
     # ----------------------------
     def compute_loss(self, lr: torch.Tensor, hr: torch.Tensor, return_debug: bool = False):
-        """
-        Mixed saliency:
-          W_mix = beta*W_cellpose + (1-beta)*W_edge
-
-        Pointwise loss on sampled HR pixels using SR_points and HR_points, with weights (1 + loss_alpha*W_mix).
-
-        Optional gradient consistency loss on random HR crop:
-          L_grad = L1(∇SR, ∇HR) weighted by (1 + W_crop)
-        """
         B, _, H_lr, W_lr = lr.shape
         Bh, _, H_hr, W_hr = hr.shape
         if B != Bh:
             raise ValueError("lr/hr batch size mismatch")
 
-        # keep tau updated even if caller never uses set_epoch()
         self._tau = float(self._compute_tau(self._epoch))
 
-        # saliency maps (requires HR for cellpose)
-        W_mix, W_cp, W_edge = self.compute_mixed_saliency(lr, hr, out_hw=(H_hr, W_hr))
+        # edge weight from LR-up
+        W_edge = self.compute_edge_saliency(lr, out_hw=(H_hr, W_hr))  # [B,1,H,W]
 
-        # upsample LR
         lr_up = F.interpolate(lr, size=(H_hr, W_hr), mode="bicubic", align_corners=False).clamp(0, 1)
         feat_lr = self.encoder(lr)
 
-        # (1) point sampling guided by W_mix
+        # ----------------------------
+        # Pixel loss with saliency-guided sampling (Residual learning + Scheme B)
+        # ----------------------------
         N = int(self.cfg.num_points)
         N_sal = int(round(N * float(self.cfg.saliency_ratio)))
         N_uni = N - N_sal
 
         loss_pix = 0.0
-        mean_mix = 0.0
-        mean_cp = 0.0
         mean_edge = 0.0
 
         for b in range(B):
-            w_flat = W_mix[b, 0].reshape(-1) + 1e-6
+            w_flat = W_edge[b, 0].reshape(-1) + 1e-6
             prob = w_flat / w_flat.sum()
 
             idx_sal = torch.multinomial(prob, num_samples=N_sal, replacement=True) if N_sal > 0 else None
             idx_uni = torch.randint(0, H_hr * W_hr, (N_uni,), device=lr.device) if N_uni > 0 else None
-
             if idx_sal is None:
                 idx = idx_uni
             elif idx_uni is None:
@@ -753,108 +619,178 @@ class SRModel(nn.Module):
 
             y = torch.div(idx, W_hr, rounding_mode="floor")
             x = idx - y * W_hr
-            hr_xy_int = torch.stack([x, y], dim=1).to(dtype=torch.float32, device=lr.device)  # [N,2]
+            hr_xy_int = torch.stack([x, y], dim=1).to(dtype=torch.float32, device=lr.device)
 
-            # base SR points
-            sr_base_pts = self.predict_points_base(
+            # model predicts something at points
+            # In residual-learning mode, interpret output as residual prediction.
+            res_pred_pts = self.predict_points_base(
                 lr=lr[b:b + 1],
                 hr_xy_int=hr_xy_int,
                 hr_hw=(H_hr, W_hr),
                 feat_lr=feat_lr[b:b + 1],
-            )[0]  # [N,3]
+            )[0].clamp(-1, 1)  # [N,3], clamp for stability (optional)
 
-            # residual SR points (cheap: pointwise res0)
-            lr_up_pts = _get_points_rgb(lr_up[b], idx)  # [N,3]
-            if bool(self.cfg.use_residual):
-                res0_pts = sr_base_pts - lr_up_pts
-                sr_pts = (lr_up_pts + res0_pts).clamp(0, 1)
-            else:
-                sr_pts = sr_base_pts
+            lr_up_pts = _get_points_rgb(lr_up[b], idx)      # [N,3]
+            hr_pts = _get_points_rgb(hr[b], idx)            # [N,3]
 
-            gt_pts = _get_points_rgb(hr[b], idx)
+            # residual target
+            res_tgt_pts = (hr_pts - lr_up_pts)              # [N,3]
 
-            ws = _get_points_map(W_mix[b], idx)
-            mean_mix += float(ws.mean().detach().cpu())
-            mean_cp += float(_get_points_map(W_cp[b], idx).mean().detach().cpu())
-            mean_edge += float(_get_points_map(W_edge[b], idx).mean().detach().cpu())
+            # build SR prediction from residual
+            sr_pts_pred = (lr_up_pts + res_pred_pts).clamp(0, 1)
 
+            # --- Scheme B: point-wise hard color fuse ---
+            # Keep chroma/color from lr_up_pts, inject only luminance delta from sr_pts_pred
+            lr_gray = (0.2989 * lr_up_pts[:, 0] + 0.5870 * lr_up_pts[:, 1] + 0.1140 * lr_up_pts[:, 2]).unsqueeze(1)
+            sr_gray = (0.2989 * sr_pts_pred[:, 0] + 0.5870 * sr_pts_pred[:, 1] + 0.1140 * sr_pts_pred[:, 2]).unsqueeze(1)
+            delta = sr_gray - lr_gray
+            sr_pts = (lr_up_pts + delta.repeat(1, 3)).clamp(0, 1)
+
+            # saliency weights
+            ws = _get_points_map(W_edge[b], idx)
+            mean_edge += float(ws.mean().detach().cpu())
             weight = 1.0 + float(self.cfg.loss_alpha) * ws
-            l1 = (sr_pts - gt_pts).abs().mean(dim=1)  # [N]
-            loss_b = (weight * l1).mean()
-            loss_pix = loss_pix + loss_b
+
+            # Pixel loss: supervise residual (recommended) to align with residual learning
+            # This keeps optimization stable & consistent with sr = lr_up + residual.
+            l1 = (res_pred_pts - res_tgt_pts).abs().mean(dim=1)  # [N]
+            loss_pix = loss_pix + (weight * l1).mean()
+
+            # (Optional) If you want a tiny SR-space anchor, uncomment:
+            # l1_sr = (sr_pts - hr_pts).abs().mean(dim=1)
+            # loss_pix = loss_pix + 0.05 * (weight * l1_sr).mean()
 
         loss_pix = loss_pix / B
-        mean_mix = mean_mix / max(B, 1)
-        mean_cp = mean_cp / max(B, 1)
         mean_edge = mean_edge / max(B, 1)
 
-        # (2) gradient consistency on random HR crop
-        lam = float(self.cfg.lambda_grad)
-        crop = int(self.cfg.grad_crop)
-
+        # ----------------------------
+        # Gradient consistency (structure) - computed on final SR crop (Scheme B)
+        # ----------------------------
+        lam_g = float(self.cfg.lambda_grad)
+        crop_g = int(self.cfg.grad_crop)
         loss_grad = torch.tensor(0.0, device=lr.device)
-        if lam > 0 and crop > 0:
-            crop = min(crop, H_hr, W_hr)
+        if lam_g > 0 and crop_g > 0:
+            crop_g = min(crop_g, H_hr, W_hr)
             grad_acc = 0.0
             for b in range(B):
-                top = torch.randint(0, H_hr - crop + 1, (1,), device=lr.device).item()
-                left = torch.randint(0, W_hr - crop + 1, (1,), device=lr.device).item()
+                top = torch.randint(0, H_hr - crop_g + 1, (1,), device=lr.device).item()
+                left = torch.randint(0, W_hr - crop_g + 1, (1,), device=lr.device).item()
 
-                hr_crop = hr[b:b + 1, :, top:top + crop, left:left + crop]
-                w_crop = W_mix[b:b + 1, :, top:top + crop, left:left + crop]
+                hr_crop = hr[b:b + 1, :, top:top + crop_g, left:left + crop_g]
+                w_crop = W_edge[b:b + 1, :, top:top + crop_g, left:left + crop_g]
 
-                ys = torch.arange(top, top + crop, device=lr.device)
-                xs = torch.arange(left, left + crop, device=lr.device)
+                ys = torch.arange(top, top + crop_g, device=lr.device)
+                xs = torch.arange(left, left + crop_g, device=lr.device)
                 yy, xx = torch.meshgrid(ys, xs, indexing="ij")
                 hr_xy_crop = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1).to(torch.float32)
 
-                sr_base_pts = self.predict_points_base(
+                # residual map predicted by base
+                res_map_pts = self.predict_points_base(
                     lr=lr[b:b + 1],
                     hr_xy_int=hr_xy_crop,
                     hr_hw=(H_hr, W_hr),
                     feat_lr=feat_lr[b:b + 1],
                 )
-                sr_base_crop = sr_base_pts.transpose(1, 2).contiguous().view(1, 3, crop, crop).clamp(0, 1)
+                res_map = res_map_pts.transpose(1, 2).contiguous().view(1, 3, crop_g, crop_g)  # residual (no clamp yet)
 
-                lr_up_crop = lr_up[b:b + 1, :, top:top + crop, left:left + crop]
-                if bool(self.cfg.use_residual):
-                    res0 = sr_base_crop - lr_up_crop
-                    if self.res_refiner is not None:
-                        res = self.res_refiner(lr_up_crop, res0)
-                    else:
-                        res = res0
-                    sr_crop = (lr_up_crop + res).clamp(0, 1)
-                else:
-                    sr_crop = sr_base_crop
+                lr_up_crop = lr_up[b:b + 1, :, top:top + crop_g, left:left + crop_g]
+
+                # build SR from residual
+                sr_pred = (lr_up_crop + res_map).clamp(0, 1)
+
+                # optional residual refiner (operates on residual between sr_pred and lr_up)
+                if self.cfg.use_residual and (self.res_refiner is not None):
+                    res0 = (sr_pred - lr_up_crop)  # residual after base
+                    res = self.res_refiner(lr_up_crop, res0)
+                    sr_pred = (lr_up_crop + res).clamp(0, 1)
+
+                # Scheme B: keep color from lr_up_crop
+                sr_crop = _fuse_keep_color(lr_up_crop, sr_pred)
 
                 grad_acc = grad_acc + _image_grad_l1(sr_crop, hr_crop, weight=(1.0 + w_crop))
 
             loss_grad = grad_acc / B
 
-        loss = loss_pix + lam * loss_grad
+        # ----------------------------
+        # FFT high-pass consistency (Scheme 2) - computed on final SR crop (Scheme B)
+        # ----------------------------
+        lam_f = float(self.cfg.lambda_fft)
+        crop_f = int(self.cfg.fft_crop)
+        loss_fft = torch.tensor(0.0, device=lr.device)
+
+        if lam_f > 0:
+            crop_f = min(max(32, crop_f), H_hr, W_hr)
+            fft_acc = 0.0
+            for b in range(B):
+                top = torch.randint(0, H_hr - crop_f + 1, (1,), device=lr.device).item()
+                left = torch.randint(0, W_hr - crop_f + 1, (1,), device=lr.device).item()
+
+                lr_up_crop = lr_up[b:b + 1, :, top:top + crop_f, left:left + crop_f]
+                hr_crop = hr[b:b + 1, :, top:top + crop_f, left:left + crop_f]
+
+                ys = torch.arange(top, top + crop_f, device=lr.device)
+                xs = torch.arange(left, left + crop_f, device=lr.device)
+                yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+                hr_xy_crop = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1).to(torch.float32)
+
+                # residual map predicted by base
+                res_map_pts = self.predict_points_base(
+                    lr=lr[b:b + 1],
+                    hr_xy_int=hr_xy_crop,
+                    hr_hw=(H_hr, W_hr),
+                    feat_lr=feat_lr[b:b + 1],
+                )
+                res_map = res_map_pts.transpose(1, 2).contiguous().view(1, 3, crop_f, crop_f)
+
+                # build SR from residual
+                sr_pred = (lr_up_crop + res_map).clamp(0, 1)
+
+                # optional residual refiner
+                if self.cfg.use_residual and (self.res_refiner is not None):
+                    res0 = (sr_pred - lr_up_crop)
+                    res = self.res_refiner(lr_up_crop, res0)
+                    sr_pred = (lr_up_crop + res).clamp(0, 1)
+
+                # Scheme B: keep color
+                sr_crop = _fuse_keep_color(lr_up_crop, sr_pred)
+
+                fft_acc = fft_acc + fft_highpass_l1(
+                    sr=sr_crop,
+                    hr=hr_crop,
+                    cutoff_ratio=float(self.cfg.fft_cutoff_ratio),
+                    use_logmag=bool(self.cfg.fft_use_logmag),
+                )
+
+            loss_fft = fft_acc / B
+
+        # total
+        loss = loss_pix + lam_g * loss_grad + lam_f * loss_fft
 
         if return_debug:
             return loss, {
                 "loss_pix": float(loss_pix.detach().cpu()),
                 "loss_grad": float(loss_grad.detach().cpu()),
-                "mean_mix": mean_mix,
-                "mean_cellpose": mean_cp,
-                "mean_edge": mean_edge,
+                "loss_fft": float(loss_fft.detach().cpu()),
+                "mean_edge": float(mean_edge),
                 "tau": float(self._tau),
+                "lambda_grad": lam_g,
+                "lambda_fft": lam_f,
+                "fft_cutoff_ratio": float(self.cfg.fft_cutoff_ratio),
             }
         return loss
 
 
+
 if __name__ == "__main__":
-    # quick self-test
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = SRModelConfig()
-    model = SRModel(cfg).to(device)
-    
-    lr = torch.rand(2, 3, 128, 128).to(device)
-    hr = torch.rand(2, 3, 512, 512).to(device)
-    
+    model = SRModel(cfg=cfg).to(device)
+
+    lr = torch.rand(2, 3, 128, 128, device=device)
+    hr = torch.rand(2, 3, 512, 512, device=device)
+
     sr = model(lr)
-    print("SR shape:", sr.shape)
-    
-    model.compute_mixed_saliency(lr, hr, out_hw=(512, 512))
+    print("sr:", sr.shape)
+
+    loss, dbg = model.compute_loss(lr, hr, return_debug=True)
+    print("loss:", float(loss), dbg)

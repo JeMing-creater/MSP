@@ -1,7 +1,5 @@
-# config.yml (clean & SR-focused)
-
-# 用于日志目录命名：logs/<checkpoint><timestamp>/
-checkpoint: "INR_Saliency_SR_v3"
+# 用于日志目录命名：logs/<checkpoint>_<timestamp>/
+checkpoint: "INR_SR_Scheme2_v4"
 
 # -----------------------
 # Dataset roots (for CLAM slicing/export)
@@ -24,7 +22,10 @@ TCGA_LIHC:
 # 这些字段在 train.py 中被直接读取
 # -----------------------
 data_loader:
-  # 输出目录（必须符合你的 loader.py 读取约定）
+  # 是否跳过切片导出（重要：train.py读取的是 data_loader.skip_slicing）
+  skip_slicing: false
+
+  # 输出目录（必须符合 loader.py 读取约定）
   # out_img_dir/
   #   hr_png/<slide_id>/patch_xxx.png
   #   lr_png/<slide_id>/patch_xxx.png
@@ -44,57 +45,41 @@ data_loader:
 
   # 控制随机性 & split
   seed: 2025
-  patch_num: 200         # build_case_split_dataloaders 用于每个 slide/case 抽样 patch 数（按你 loader 实现）
+  patch_num: 200
   train_ratio: 0.7
   val_ratio: 0.1
   test_ratio: 0.2
 
-  skip_slicing: false
-
 # -----------------------
-# Model settings (INR + DINOv2 saliency guidance)
+# Model settings (方案2：不依赖DINO/HoVer)
 # train.py 会用这些超参构建 SRModelConfig / SRModel
 # -----------------------
 model:
-  use_hovernet_guidance: true
-  hovernet_pretrained_name: "hgsc_v1_efficientnet_b5"
-  hovernet_use_gray: true
-  hovernet_mix_beta: 0.5
-  hovernet_weight_alpha: 1.0
+  # INR / kernel predictor
   feat_ch: 64
   pe_bands: 10
   mlp_hidden: 256
   mlp_depth: 5
 
+  # dynamic kernel
   kernel_size: 7
+  kernel_allow_negative: true
 
+  # point sampling / weighting
   num_points: 4096
   saliency_ratio: 0.7
   loss_alpha: 3.0
 
+  # residual SR
+  use_residual: true
+  use_res_refiner: true
+
+  # structure / gradient consistency（你提过要引入结构梯度一致性）
   lambda_grad: 0.2
   grad_crop: 128
 
+  # inference chunking
   infer_chunk: 8192
-
-  use_dino_saliency: true
-  dino_hf_dir: "src/models/dinov2_vitb14"
-
-  kernel_allow_negative: true
-
-  # mixed saliency
-  saliency_mix_beta: 0.4     # 0.3~0.5 推荐
-
-  # residual SR
-  use_residual: true
-  use_res_refiner: true     # 先 false，稳定后再 true
-
-  # temperature annealing
-  tau_start: 1.0
-  tau_end: 0.5
-  tau_warm_epochs: 2
-  tau_anneal_epochs: 8
-
 
 # -----------------------
 # Trainer settings
@@ -113,9 +98,9 @@ trainer:
 # -----------------------
 validator:
   do_val: true
-  max_batches: -1            # -1 表示验证集全跑；若只想抽样验证可设为正数
-  metric_for_best: "lpips"    # 你也可以改成 "lpips"（注意 best 方向相反）
-  best_mode: "min"           # psnr/ssim -> max；lpips -> min
+  max_batches: -1
+  metric_for_best: "lpips"
+  best_mode: "min"
 
   # 每轮验证保存一张随机可视化：HR / LR_up / SR 拼接图
   save_vis: true
