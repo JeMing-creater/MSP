@@ -337,7 +337,7 @@ class SRModelConfig:
     tau_anneal_epochs: int = 8
 
     # residual SR
-    use_residual: bool = False
+    use_residual: bool = True
     use_res_refiner: bool = True
 
 
