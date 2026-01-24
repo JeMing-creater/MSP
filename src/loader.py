@@ -173,22 +173,22 @@ def _has_done_flag(hr_slide_dir: str) -> bool:
 class PathologySRSurvivalDataset(Dataset):
     """
     Patch-level dataset for SR + survival:
-      - Reads paired (lr, hr) PNG patches + cached tissue mask PNG
+      - Reads paired (lr, hr) PNG patches
+      - (NEW) Reads HoVer-Net boundary png as condition map
       - Filters cases without valid survival time
-      - Filters slides without .DONE if require_done=True
-      - Ensures lr/hr/mask are aligned by patch filename
+      - Ensures lr/hr/(hover) are aligned by patch filename
       - patch_num: per-slide cap (take first N patches sorted by name)
 
     Return dict:
       {
         "lr": Tensor[3,128,128],
         "hr": Tensor[3,512,512],
+        "hover": Tensor[1,512,512] (0/1 float)   # NEW
         "time": Tensor[],
         "event": Tensor[],
         "meta": {...}
       }
     """
-
     def __init__(
         self,
         out_img_dir: str,
@@ -198,12 +198,25 @@ class PathologySRSurvivalDataset(Dataset):
         require_done: bool = True,
         patch_num: int = 200,
         transform_lr=None,
-        transform_hr=None
+        transform_hr=None,
+        # --- NEW: two hover dirs ---
+        hover_bnd_subdir: str = "hovernet_boundary_png",
+        hover_mask_subdir: str = "hovernet_nucmask_png",
+        require_hover: bool = False,
+        hover_is_binary: bool = True,
+        hover_threshold: int = 8,  # 0~255
     ):
         self.out_img_dir = out_img_dir
         self.hr_root = os.path.join(out_img_dir, "hr_png")
         self.lr_root = os.path.join(out_img_dir, "lr_png")
         self.clin_path = os.path.join(out_img_dir, "clinical.tsv")
+
+        # --- NEW ---
+        self.hover_bnd_root = os.path.join(out_img_dir, hover_bnd_subdir)
+        self.hover_mask_root = os.path.join(out_img_dir, hover_mask_subdir)
+        self.require_hover = bool(require_hover)
+        self.hover_is_binary = bool(hover_is_binary)
+        self.hover_threshold = int(hover_threshold)
 
         if not os.path.isdir(self.hr_root):
             raise FileNotFoundError(f"hr_png not found: {self.hr_root}")
@@ -211,6 +224,20 @@ class PathologySRSurvivalDataset(Dataset):
             raise FileNotFoundError(f"lr_png not found: {self.lr_root}")
         if not os.path.exists(self.clin_path):
             raise FileNotFoundError(f"clinical.tsv not found: {self.clin_path}")
+
+        # hover roots can be missing if not generated yet
+        if self.require_hover:
+            if not os.path.isdir(self.hover_bnd_root):
+                raise FileNotFoundError(f"require_hover=True but not found: {self.hover_bnd_root}")
+            if not os.path.isdir(self.hover_mask_root):
+                raise FileNotFoundError(f"require_hover=True but not found: {self.hover_mask_root}")
+        else:
+            if not os.path.isdir(self.hover_bnd_root):
+                print(f"[dataset][WARN] hover boundary dir not found: {self.hover_bnd_root}")
+                self.hover_bnd_root = None
+            if not os.path.isdir(self.hover_mask_root):
+                print(f"[dataset][WARN] hover mask dir not found: {self.hover_mask_root}")
+                self.hover_mask_root = None
 
         self.require_done = bool(require_done)
         self.patch_num = int(patch_num)
@@ -225,26 +252,11 @@ class PathologySRSurvivalDataset(Dataset):
         else:
             self.transform_hr = transform_hr
 
-        # --- load survival table ---
+        # --- survival table ---
         df = pd.read_csv(self.clin_path, sep="\t")
         surv_map = build_survival_map(df, id_col=id_col, death_col=death_col, follow_col=follow_col)
         df[id_col] = df[id_col].astype(str)
-        
-        
-        
-        
-        self.project_map: Dict[str, str] = {}
-        if "project_id" in df.columns:
-            self.project_map = dict(zip(df[id_col].tolist(), df["project_id"].astype(str).tolist()))
-        elif "dataset_name" in df.columns:
-            # fallback if your tsv uses another column name
-            self.project_map = dict(zip(df[id_col].tolist(), df["dataset_name"].astype(str).tolist()))
-        else:
-            self.project_map = {}
-        
-        
-        df[id_col] = df[id_col].astype(str)
-        self.project_map: Dict[str, str] = {}
+
         if "project_id" in df.columns:
             self.project_map = dict(zip(df[id_col].tolist(), df["project_id"].astype(str).tolist()))
         elif "dataset_name" in df.columns:
@@ -252,17 +264,12 @@ class PathologySRSurvivalDataset(Dataset):
         else:
             self.project_map = {}
 
-        # placeholders; will be filled after self.items is built
-        self._time_min: float = 0.0
-        self._time_max: float = 0.0
-        self._time_edges: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-        
-        
-        
-        
-        # --- detect folder layout ---
-        # Layout A: hr_png/<case>/<slide>/*.png
-        # Layout B: hr_png/<slide>/*.png
+        # placeholders
+        self._time_min = 0.0
+        self._time_max = 0.0
+        self._time_edges = (0.0, 0.0, 0.0)
+
+        # --- detect layout ---
         first_level = sorted([d for d in os.listdir(self.hr_root) if os.path.isdir(os.path.join(self.hr_root, d))])
 
         def _dir_has_pngs(d: str) -> bool:
@@ -275,36 +282,46 @@ class PathologySRSurvivalDataset(Dataset):
             return False
 
         layout_is_slide_level = False
-        # heuristic: if any first-level dir directly contains png => slide-level
         for name in first_level[: min(20, len(first_level))]:
             if _dir_has_pngs(os.path.join(self.hr_root, name)):
                 layout_is_slide_level = True
                 break
 
+        # --- helper for hover paths ---
+        def _get_hover_path(root: Optional[str], slide_id: str, patch_name: str, case_id: Optional[str] = None) -> Optional[str]:
+            if root is None:
+                return None
+
+            # preferred: <root>/<slide>/<patch>
+            p1 = os.path.join(root, slide_id, patch_name)
+            if os.path.exists(p1):
+                return p1
+
+            # fallback: <root>/<case>/<slide>/<patch>
+            if case_id is not None:
+                p2 = os.path.join(root, case_id, slide_id, patch_name)
+                if os.path.exists(p2):
+                    return p2
+
+            return p1  # return expected location for debug
+
+        # --- build items ---
         self.items = []
-        skipped_no_surv = 0
-        skipped_no_hr_slide = 0
-        skipped_no_lr_slide = 0
+        skipped_missing_hover = 0
         skipped_missing_lr = 0
+        skipped_no_surv = 0
+        skipped_no_lr_slide = 0
+        skipped_no_hr_slide = 0
         skipped_no_done = 0
 
         if layout_is_slide_level:
-            # ---------- Layout B: hr_png/<slide_id>/*.png ----------
             hr_slides = first_level
-            if len(hr_slides) == 0:
-                skipped_no_hr_slide = 1  # just a marker
             for slide_id in hr_slides:
                 hr_slide_dir = os.path.join(self.hr_root, slide_id)
                 lr_slide_dir = os.path.join(self.lr_root, slide_id)
-
                 if not os.path.isdir(lr_slide_dir):
                     skipped_no_lr_slide += 1
                     continue
-
-                # if self.require_done and (not _has_done_flag(hr_slide_dir)):
-                #     skipped_no_done += 1
-                #     continue
-
 
                 case_id = slide_to_case_id(slide_id)
                 surv = surv_map.get(case_id, None)
@@ -326,19 +343,28 @@ class PathologySRSurvivalDataset(Dataset):
                         skipped_missing_lr += 1
                         continue
 
+                    bnd_path = _get_hover_path(self.hover_bnd_root, slide_id, patch_name, case_id)
+                    msk_path = _get_hover_path(self.hover_mask_root, slide_id, patch_name, case_id)
+
+                    if self.require_hover:
+                        if (bnd_path is None) or (not os.path.exists(bnd_path)) or (msk_path is None) or (not os.path.exists(msk_path)):
+                            skipped_missing_hover += 1
+                            continue
+
                     self.items.append(
-                        {
-                            "case_id": case_id,
-                            "slide_id": slide_id,
-                            "hr_path": hr_path,
-                            "lr_path": lr_path,
-                            "time": float(surv.time),
-                            "event": int(surv.event),
-                            "project": self.project_map.get(case_id, ""),
-                        }
+                        dict(
+                            case_id=case_id,
+                            slide_id=slide_id,
+                            hr_path=hr_path,
+                            lr_path=lr_path,
+                            hover_bnd_path=bnd_path,
+                            hover_mask_path=msk_path,
+                            time=float(surv.time),
+                            event=int(surv.event),
+                            project=self.project_map.get(case_id, ""),
+                        )
                     )
         else:
-            # ---------- Layout A: hr_png/<case_id>/<slide_id>/*.png ----------
             hr_cases = first_level
             for case_id in hr_cases:
                 case_dir = os.path.join(self.hr_root, case_id)
@@ -351,14 +377,13 @@ class PathologySRSurvivalDataset(Dataset):
                     continue
 
                 slides = sorted([d for d in os.listdir(case_dir) if os.path.isdir(os.path.join(case_dir, d))])
-                if len(slides) == 0:
+                if not slides:
                     skipped_no_hr_slide += 1
                     continue
 
                 for slide_id in slides:
                     hr_slide_dir = os.path.join(self.hr_root, case_id, slide_id)
                     lr_slide_dir = os.path.join(self.lr_root, case_id, slide_id)
-
                     if not os.path.isdir(lr_slide_dir):
                         skipped_no_lr_slide += 1
                         continue
@@ -378,40 +403,43 @@ class PathologySRSurvivalDataset(Dataset):
                             skipped_missing_lr += 1
                             continue
 
+                        bnd_path = _get_hover_path(self.hover_bnd_root, slide_id, patch_name, case_id)
+                        msk_path = _get_hover_path(self.hover_mask_root, slide_id, patch_name, case_id)
+
+                        if self.require_hover:
+                            if (bnd_path is None) or (not os.path.exists(bnd_path)) or (msk_path is None) or (not os.path.exists(msk_path)):
+                                skipped_missing_hover += 1
+                                continue
+
                         self.items.append(
-                            {
-                                "case_id": case_id,
-                                "slide_id": slide_id,
-                                "hr_path": hr_path,
-                                "lr_path": lr_path,
-                                "time": float(surv.time),
-                                "event": int(surv.event),
-                                "project": self.project_map.get(case_id, ""),
-                            }
+                            dict(
+                                case_id=case_id,
+                                slide_id=slide_id,
+                                hr_path=hr_path,
+                                lr_path=lr_path,
+                                hover_bnd_path=bnd_path,
+                                hover_mask_path=msk_path,
+                                time=float(surv.time),
+                                event=int(surv.event),
+                                project=self.project_map.get(case_id, ""),
+                            )
                         )
 
         print(
             f"[dataset] layout={'slide_level' if layout_is_slide_level else 'case_level'} | "
-            f"items={len(self.items)} | "
-            f"skipped(no_surv)={skipped_no_surv} | "
-            f"skipped(no_hr_slide)={skipped_no_hr_slide} | "
-            f"skipped(no_lr_slide)={skipped_no_lr_slide} | "
-            f"skipped(no_done)={skipped_no_done} | "
-            f"skipped(missing lr)={skipped_missing_lr} | "
+            f"items={len(self.items)} | skipped_missing_hover={skipped_missing_hover} | "
+            f"skipped_missing_lr={skipped_missing_lr} | skipped_no_surv={skipped_no_surv} | "
+            f"hover_bnd_root={self.hover_bnd_root} hover_mask_root={self.hover_mask_root}"
         )
-        
-        
-        
-        case_to_time: Dict[str, float] = {}
-        
+
+        # --- time edges ---
+        case_to_time = {}
         for it in self.items:
             cid = it["case_id"]
             if cid not in case_to_time:
-                # ensure float
                 case_to_time[cid] = float(it["time"])
 
         if len(case_to_time) == 0:
-            # if this happens, your dataset filtering removed all cases
             self._time_min = 0.0
             self._time_max = 0.0
             self._time_edges = (0.0, 0.0, 0.0)
@@ -419,21 +447,14 @@ class PathologySRSurvivalDataset(Dataset):
             times = np.array(list(case_to_time.values()), dtype=np.float64)
             self._time_min = float(times.min())
             self._time_max = float(times.max())
-
             if self._time_max <= self._time_min:
-                # degenerate: all same time
                 self._time_edges = (self._time_min, self._time_min, self._time_min)
             else:
                 step = (self._time_max - self._time_min) / 4.0
-                e1 = self._time_min + step
-                e2 = self._time_min + 2.0 * step
-                e3 = self._time_min + 3.0 * step
-                self._time_edges = (float(e1), float(e2), float(e3))
+                self._time_edges = (float(self._time_min + step), float(self._time_min + 2 * step), float(self._time_min + 3 * step))
 
-        # optional: print for sanity
-        print(f"[time_Y] min={self._time_min:.2f} max={self._time_max:.2f} edges={self._time_edges}", flush=True)
-    
-    
+
+
     # -------- robust readers --------
     @staticmethod
     def _read_rgb_pil_or_cv2(path: str) -> Image.Image:
@@ -446,32 +467,19 @@ class PathologySRSurvivalDataset(Dataset):
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             return Image.fromarray(img)
 
+    @staticmethod
+    def _read_gray_u8_pil_or_cv2(path: str) -> np.ndarray:
+        """Read grayscale png as uint8 HxW (0~255)."""
+        try:
+            img = Image.open(path).convert("L")
+            return np.array(img, dtype=np.uint8)
+        except Exception:
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                raise RuntimeError(f"Failed to read grayscale image: {path}")
+            return img.astype(np.uint8, copy=False)
 
-    def _calculate_discrete_time_bin(self, survival_times, bins=4):
-        sorted_times = np.sort(survival_times)
-        split_points_indices = [int(len(sorted_times) * p / bins) for p in range(1, bins)]
-        split_points = sorted_times[split_points_indices]
-
-        times = []
-        for time in survival_times:
-            for i in range(len(split_points)):
-                if time < split_points[i]:
-                    times.append(i)
-                    break
-            else:
-                times.append(len(split_points))
-        return times
-    
-    
     def _time_to_timeY_equal_range(self, t: float) -> int:
-        """
-        Map survival time t to {0,1,2,3} using equal-width bins in [min,max].
-        edges = (e1,e2,e3) where:
-          0: [min, e1)
-          1: [e1, e2)
-          2: [e2, e3)
-          3: [e3, max]
-        """
         e1, e2, e3 = self._time_edges
         if self._time_max <= self._time_min:
             return 0
@@ -483,23 +491,43 @@ class PathologySRSurvivalDataset(Dataset):
             return 2
         else:
             return 3
-    
-    # -------- dataset API --------
+
     def __len__(self) -> int:
         return len(self.items)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         it = self.items[idx]
 
-        lr_img = self._read_rgb_pil_or_cv2(it["lr_path"])  # 128x128 RGB
-        hr_img = self._read_rgb_pil_or_cv2(it["hr_path"])  # 512x512 RGB
+        lr_img = self._read_rgb_pil_or_cv2(it["lr_path"])
+        hr_img = self._read_rgb_pil_or_cv2(it["hr_path"])
 
-        lr = self.transform_lr(lr_img)  # [3,128,128] in [0,1]
-        hr = self.transform_hr(hr_img)  # [3,512,512] in [0,1]
+        lr = self.transform_lr(lr_img)  # [3,128,128]
+        hr = self.transform_hr(hr_img)  # [3,512,512]
 
-        
+        H, W = int(hr.shape[1]), int(hr.shape[2])
 
-        
+        def _read_hover(path: Optional[str]) -> torch.Tensor:
+            if (path is None) or (not os.path.exists(path)):
+                return torch.zeros((1, H, W), dtype=torch.float32)
+            try:
+                img = Image.open(path).convert("L")
+                t = transforms.ToTensor()(img).float()  # [1,h,w] in [0,1]
+            except Exception:
+                m = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if m is None:
+                    return torch.zeros((1, H, W), dtype=torch.float32)
+                t = torch.from_numpy(m.astype(np.float32) / 255.0).unsqueeze(0)
+
+            if self.hover_is_binary:
+                thr = float(self.hover_threshold) / 255.0
+                t = (t > thr).float()
+
+            if (t.shape[1] != H) or (t.shape[2] != W):
+                t = torch.nn.functional.interpolate(t.unsqueeze(0), size=(H, W), mode="nearest").squeeze(0)
+            return t
+
+        hover_bnd = _read_hover(it.get("hover_bnd_path", None))
+        hover_mask = _read_hover(it.get("hover_mask_path", None))
 
         time_val = float(it["time"])
         time_y = self._time_to_timeY_equal_range(time_val)
@@ -507,18 +535,19 @@ class PathologySRSurvivalDataset(Dataset):
         out = {
             "lr": lr,
             "hr": hr,
+            "hover_bnd": hover_bnd,     # NEW
+            "hover_mask": hover_mask,   # NEW
             "time": torch.tensor(time_val, dtype=torch.float32),
             "event": torch.tensor(int(it["event"]), dtype=torch.long),
-
-            # ✅ new
             "time_Y": torch.tensor(time_y, dtype=torch.long),
             "project": it.get("project", ""),
-
             "meta": {
                 "case_id": it["case_id"],
                 "slide_id": it["slide_id"],
                 "lr_path": it["lr_path"],
                 "hr_path": it["hr_path"],
+                "hover_bnd_path": it.get("hover_bnd_path", None),
+                "hover_mask_path": it.get("hover_mask_path", None),
                 "project": it.get("project", ""),
             },
         }
@@ -652,7 +681,7 @@ if __name__ == "__main__":
     from easydict import EasyDict
     
     config = EasyDict(
-        yaml.load(open("/workspace/New_SR/config.yml", "r", encoding="utf-8"), Loader=yaml.FullLoader)
+        yaml.load(open("/workspace/SPR_new/config.yml", "r", encoding="utf-8"), Loader=yaml.FullLoader)
     )
     
     train_loader, val_loader, test_loader = build_case_split_dataloaders(
@@ -669,15 +698,19 @@ if __name__ == "__main__":
     for batch in train_loader:
         print(batch["lr"])
         print(batch["hr"])
+        print(batch["hover_bnd"])
+        print(batch["hover_mask"])
         print(batch["time"])
     
     for batch in val_loader:
         print(batch["lr"])
         print(batch["hr"])
+        print(batch["hover"])
         print(batch["time"])
     
     for batch in test_loader:
         print(batch["lr"])
         print(batch["hr"])
+        print(batch["hover"])
         print(batch["time"])
     

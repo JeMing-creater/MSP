@@ -1,19 +1,23 @@
 # gen_hovernet_maps.py
 # ------------------------------------------------------------
-# TIAToolbox HoVer-Net predict -> tmp/*.dat -> decode -> boundary PNG
-#
-# Fixes your exact failure mode:
-# - Many TIAToolbox versions do NOT store inst_map in .dat;
-#   they store per-instance contours (arrays ending with ".contour" / containing "contour").
-# - This script decodes:
-#     1) inst_map if present
-#     2) else contours -> draw polylines -> boundary map
+# TIAToolbox HoVer-Net predict -> tmp/*.dat -> decode -> (boundary png + filled mask png)
 #
 # Outputs:
-#   out_img_dir/hovernet_boundary_png/<slide>/<patch_stem>.png
-#   out_img_dir/hovernet_boundary_png/<slide>/__debug_boundary_preview.png  (first success)
-#   out_img_dir/hovernet_boundary_png/<slide>/.HOVERNET_DONE
-#   out_root/__debug_artifact_report_<tmp_name>.txt (per chunk)
+#   out_img_dir/hovernet_boundary_png/<slide>/<patch>.png     (outline)
+#   out_img_dir/hovernet_nucmask_png/<slide>/<patch>.png      (filled nuclei mask)
+#
+# Designed for your environment:
+# - Many TIAToolbox versions store contours in .dat (no inst_map)
+# - This script:
+#     1) tries inst_map (if exists) -> boundary+mask
+#     2) else uses contours -> draw polylines + fillPoly -> boundary+mask
+#
+# Robustness:
+# - Unique tmp save_dir (must NOT exist)
+# - Skips non-index artifacts (file_map.dat etc.)
+# - Chunk report: __debug_artifact_report_<tmp>.txt
+# - Optional debug previews: __debug_boundary_preview.png + __debug_mask_preview.png
+# - Resume-friendly: skip existing outputs; slide DONE marker
 # ------------------------------------------------------------
 
 import os
@@ -24,7 +28,7 @@ import glob
 import shutil
 import argparse
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import cv2
@@ -86,7 +90,7 @@ def find_prediction_artifacts(tmp_save: Path) -> List[Path]:
 
 
 # -------------------------
-# Boundary ops
+# Morphology helpers
 # -------------------------
 def dilate_binary(img: np.ndarray, k: int) -> np.ndarray:
     if k is None or k <= 1:
@@ -96,63 +100,6 @@ def dilate_binary(img: np.ndarray, k: int) -> np.ndarray:
         kk += 1
     kernel = np.ones((kk, kk), np.uint8)
     return cv2.dilate(img, kernel, iterations=1)
-
-
-def inst_map_to_boundary(inst_map: np.ndarray, dilate: int = 3) -> np.ndarray:
-    inst_map = inst_map.astype(np.int32, copy=False)
-    H, W = inst_map.shape
-    boundary = np.zeros((H, W), dtype=np.uint8)
-
-    ids = np.unique(inst_map)
-    ids = ids[ids != 0]
-    for _id in ids:
-        m = (inst_map == _id).astype(np.uint8)
-        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        if cnts:
-            cv2.drawContours(boundary, cnts, -1, 255, thickness=1)
-
-    boundary = dilate_binary(boundary, dilate)
-    return boundary
-
-
-def contours_to_boundary(
-    contours: List[np.ndarray],
-    canvas_hw: Tuple[int, int],
-    dilate: int = 3,
-) -> np.ndarray:
-    H, W = int(canvas_hw[0]), int(canvas_hw[1])
-    boundary = np.zeros((H, W), dtype=np.uint8)
-
-    # Each contour: Nx2 (x,y) or Nx1x2 or 2xN...
-    for c in contours:
-        if c is None:
-            continue
-        c = np.asarray(c)
-        if c.size < 6:
-            continue
-
-        # normalize shape to Nx2
-        if c.ndim == 3 and c.shape[-1] == 2:
-            pts = c.reshape(-1, 2)
-        elif c.ndim == 2 and c.shape[1] == 2:
-            pts = c
-        elif c.ndim == 2 and c.shape[0] == 2:  # 2xN
-            pts = c.T
-        else:
-            continue
-
-        pts = np.round(pts).astype(np.int32)
-
-        # clip
-        pts[:, 0] = np.clip(pts[:, 0], 0, W - 1)
-        pts[:, 1] = np.clip(pts[:, 1], 0, H - 1)
-
-        # OpenCV wants shape Nx1x2
-        pts_cv = pts.reshape(-1, 1, 2)
-        cv2.polylines(boundary, [pts_cv], isClosed=True, color=255, thickness=1)
-
-    boundary = dilate_binary(boundary, dilate)
-    return boundary
 
 
 # -------------------------
@@ -201,13 +148,12 @@ def try_extract_inst_map(obj: Any) -> Optional[np.ndarray]:
     """
     Conservative: only accept a real 2D integer map with background zeros.
     """
-    # fast known keys
     if isinstance(obj, dict):
         for k in ("inst_map", "instance_map"):
             if k in obj and isinstance(obj[k], np.ndarray) and obj[k].ndim == 2:
                 a = obj[k]
                 if np.issubdtype(a.dtype, np.integer):
-                    if (a == 0).mean() > 0.05 and a.max() > 0:
+                    if (a == 0).mean() > 0.01 and int(a.max()) > 0:
                         return a.astype(np.int32, copy=False)
 
         for k in ("inst_dict", "pred", "result", "output", "pred_inst"):
@@ -216,36 +162,34 @@ def try_extract_inst_map(obj: Any) -> Optional[np.ndarray]:
                     if kk in obj[k] and isinstance(obj[k][kk], np.ndarray) and obj[k][kk].ndim == 2:
                         a = obj[k][kk]
                         if np.issubdtype(a.dtype, np.integer):
-                            if (a == 0).mean() > 0.05 and a.max() > 0:
+                            if (a == 0).mean() > 0.01 and int(a.max()) > 0:
                                 return a.astype(np.int32, copy=False)
 
-    # fallback scan: find first 2D integer-ish map with many zeros and max>0
     for p, v in _iter_items(obj):
-        if isinstance(v, np.ndarray) and v.ndim == 2:
-            if np.issubdtype(v.dtype, np.integer):
-                if v.size >= 256 and (v == 0).mean() > 0.05 and int(v.max()) > 0 and int(v.max()) < 50000:
-                    return v.astype(np.int32, copy=False)
+        if isinstance(v, np.ndarray) and v.ndim == 2 and np.issubdtype(v.dtype, np.integer):
+            if v.size >= 256 and (v == 0).mean() > 0.01 and int(v.max()) > 0 and int(v.max()) < 50000:
+                return v.astype(np.int32, copy=False)
+
     return None
 
 
 def extract_contours(obj: Any) -> List[np.ndarray]:
     """
     Extract contour coordinate arrays.
-    We accept arrays that look like Nx2 coordinates and whose path contains 'contour'.
+    Accept arrays that look like Nx2 coordinates and whose path contains 'contour'.
     """
     contours: List[np.ndarray] = []
     for p, v in _iter_items(obj):
         if "contour" not in p.lower():
             continue
+
         if isinstance(v, np.ndarray):
             a = v
-            # accept coordinate-like arrays
             if a.ndim == 2 and (a.shape[1] == 2 or a.shape[0] == 2) and a.size >= 6:
                 contours.append(a)
             elif a.ndim == 3 and a.shape[-1] == 2 and a.size >= 6:
                 contours.append(a)
 
-        # sometimes contour is stored as list of arrays
         if isinstance(v, (list, tuple)):
             for vv in v:
                 if isinstance(vv, np.ndarray):
@@ -254,13 +198,13 @@ def extract_contours(obj: Any) -> List[np.ndarray]:
                         contours.append(a)
                     elif a.ndim == 3 and a.shape[-1] == 2 and a.size >= 6:
                         contours.append(a)
+
     return contours
 
 
 def infer_canvas_hw_from_contours(contours: List[np.ndarray], fallback_hw: Tuple[int, int]) -> Tuple[int, int]:
     """
-    If contours are in output resolution (e.g., 420x420), infer H/W by max coord.
-    Otherwise fallback to source patch size.
+    Infer contour canvas size from max coords; fallback to source patch size.
     """
     if not contours:
         return fallback_hw
@@ -272,29 +216,118 @@ def infer_canvas_hw_from_contours(contours: List[np.ndarray], fallback_hw: Tuple
             continue
         max_x = max(max_x, int(np.nanmax(a[:, 0])))
         max_y = max(max_y, int(np.nanmax(a[:, 1])))
-    # if max coords look plausible
     H = max_y + 1
     W = max_x + 1
-    if H >= 64 and W >= 64 and H <= 5000 and W <= 5000:
+    if H >= 64 and W >= 64 and H <= 6000 and W <= 6000:
         return (H, W)
     return fallback_hw
 
 
+def _normalize_contour_pts(c: np.ndarray, H: int, W: int) -> Optional[np.ndarray]:
+    """
+    Convert various contour shapes to Nx2 int32 (x,y) and clip.
+    """
+    if c is None:
+        return None
+    a = np.asarray(c)
+    if a.size < 6:
+        return None
+
+    # normalize to Nx2
+    if a.ndim == 3 and a.shape[-1] == 2:
+        pts = a.reshape(-1, 2)
+    elif a.ndim == 2 and a.shape[1] == 2:
+        pts = a
+    elif a.ndim == 2 and a.shape[0] == 2:
+        pts = a.T
+    else:
+        return None
+
+    pts = np.round(pts).astype(np.int32)
+
+    # clip
+    pts[:, 0] = np.clip(pts[:, 0], 0, W - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, H - 1)
+    return pts
+
+
 # -------------------------
-# Decode artifact -> boundary
+# Draw from inst_map / contours
 # -------------------------
-def decode_artifact_to_boundary(
+def inst_map_to_boundary_and_mask(inst_map: np.ndarray, dilate: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    inst_map: [H,W] int
+    returns:
+      boundary_u8 [H,W] 0/255
+      mask_u8     [H,W] 0/255  (filled nuclei regions)
+    """
+    m = inst_map.astype(np.int32, copy=False)
+    H, W = m.shape
+    boundary = np.zeros((H, W), dtype=np.uint8)
+    mask = np.zeros((H, W), dtype=np.uint8)
+
+    ids = np.unique(m)
+    ids = ids[ids != 0]
+
+    for _id in ids:
+        binm = (m == _id).astype(np.uint8)
+        if binm.max() == 0:
+            continue
+        mask[binm > 0] = 255
+        cnts, _ = cv2.findContours(binm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if cnts:
+            cv2.drawContours(boundary, cnts, -1, 255, thickness=1)
+
+    boundary = dilate_binary(boundary, dilate)
+    return boundary, mask
+
+
+def contours_to_boundary_and_mask(
+    contours: List[np.ndarray],
+    canvas_hw: Tuple[int, int],
+    dilate: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    contours: list of coordinate arrays
+    canvas_hw: (H,W) for drawing in contour coordinate space
+    returns boundary+mask in that canvas space
+    """
+    H, W = int(canvas_hw[0]), int(canvas_hw[1])
+    boundary = np.zeros((H, W), dtype=np.uint8)
+    mask = np.zeros((H, W), dtype=np.uint8)
+
+    for c in contours:
+        pts = _normalize_contour_pts(c, H, W)
+        if pts is None or pts.shape[0] < 3:
+            continue
+
+        pts_cv = pts.reshape(-1, 1, 2)
+        # outline
+        cv2.polylines(boundary, [pts_cv], isClosed=True, color=255, thickness=1)
+        # filled region
+        cv2.fillPoly(mask, [pts_cv], color=255)
+
+    boundary = dilate_binary(boundary, dilate)
+    return boundary, mask
+
+
+# -------------------------
+# Decode artifact -> boundary+mask
+# -------------------------
+def decode_artifact_to_maps(
     artifact_path: Path,
     src_patch_path: Optional[str],
     dilate: int,
     report_lines: List[str],
-) -> Tuple[Optional[np.ndarray], str]:
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
     """
-    Returns (boundary, mode_used) where mode_used is 'inst_map' or 'contour' or 'none'.
+    Returns (boundary_u8, mask_u8, mode_used)
+      - boundary_u8/mask_u8 are in FINAL src patch size if src_patch_path exists, else in canvas size.
+      - mode_used: 'inst_map' | 'contour' | 'none'
     """
     obj = joblib.load(artifact_path)
 
-    # Determine target output size from src patch (final output should match src)
+    # final target size from src patch
     src_hw = None
     if src_patch_path is not None:
         img = cv2.imread(src_patch_path, cv2.IMREAD_COLOR)
@@ -303,39 +336,46 @@ def decode_artifact_to_boundary(
     if src_hw is None:
         src_hw = (512, 512)
 
-    # 1) try inst_map
+    # 1) inst_map path
     inst_map = try_extract_inst_map(obj)
     if inst_map is not None:
-        bnd = inst_map_to_boundary(inst_map, dilate=dilate)
-        # resize to src if needed
+        bnd, msk = inst_map_to_boundary_and_mask(inst_map, dilate=dilate)
+
+        # resize to src
         if bnd.shape[:2] != src_hw:
             bnd = cv2.resize(bnd, (src_hw[1], src_hw[0]), interpolation=cv2.INTER_NEAREST)
-        # stats
+        if msk.shape[:2] != src_hw:
+            msk = cv2.resize(msk, (src_hw[1], src_hw[0]), interpolation=cv2.INTER_NEAREST)
+
         uniq = np.unique(inst_map)
         report_lines.append(
-            f"  [USE inst_map] shape={inst_map.shape} min={int(inst_map.min())} max={int(inst_map.max())} "
-            f"uniq={len(uniq)} bg_ratio={(inst_map==0).mean():.3f}"
+            f"  [USE inst_map] inst_shape={inst_map.shape} min={int(inst_map.min())} max={int(inst_map.max())} "
+            f"uniq={len(uniq)} bg_ratio={(inst_map==0).mean():.3f} final_hw={src_hw}"
         )
-        return bnd, "inst_map"
+        return bnd, msk, "inst_map"
 
-    # 2) contour path (your current .dat looks like this)
+    # 2) contour path
     contours = extract_contours(obj)
     report_lines.append(f"  contour_count={len(contours)}")
     if contours:
         canvas_hw = infer_canvas_hw_from_contours(contours, fallback_hw=src_hw)
-        bnd = contours_to_boundary(contours, canvas_hw=canvas_hw, dilate=dilate)
+        bnd, msk = contours_to_boundary_and_mask(contours, canvas_hw=canvas_hw, dilate=dilate)
 
-        # resize to src size (final alignment)
+        # resize to src patch size
         if bnd.shape[:2] != src_hw:
             bnd = cv2.resize(bnd, (src_hw[1], src_hw[0]), interpolation=cv2.INTER_NEAREST)
+        if msk.shape[:2] != src_hw:
+            msk = cv2.resize(msk, (src_hw[1], src_hw[0]), interpolation=cv2.INTER_NEAREST)
 
-        # boundary density for sanity (avoid all-white)
-        density = float((bnd > 0).mean())
-        report_lines.append(f"  [USE contour] canvas_hw={canvas_hw} final_hw={src_hw} boundary_density={density:.4f}")
-        return bnd, "contour"
+        bden = float((bnd > 0).mean())
+        mden = float((msk > 0).mean())
+        report_lines.append(
+            f"  [USE contour] canvas_hw={canvas_hw} final_hw={src_hw} boundary_density={bden:.4f} mask_density={mden:.4f}"
+        )
+        return bnd, msk, "contour"
 
     report_lines.append("  [USE none] no inst_map and no contour found")
-    return None, "none"
+    return None, None, "none"
 
 
 # -------------------------
@@ -361,7 +401,8 @@ def process_one_chunk(
     ioconfig,
     sub_pngs: List[str],
     tmp_save: Path,
-    out_slide_dir: Path,
+    out_bnd_dir: Path,
+    out_msk_dir: Path,
     device: str,
     dilate: int,
     overwrite: bool,
@@ -372,7 +413,6 @@ def process_one_chunk(
     Returns:
       artifacts_count, mapped_count, instmap_used, contour_used, written, failed, report_path
     """
-    # DO NOT create tmp_save dir yourself
     _ = inst_segmentor.predict(
         sub_pngs,
         save_dir=str(tmp_save),
@@ -391,37 +431,36 @@ def process_one_chunk(
     written = 0
     failed = 0
 
-    # write a detailed report per chunk
     report_path = tmp_save.parent / f"__debug_artifact_report_{tmp_save.name}.txt"
     report_lines: List[str] = []
     report_lines.append(f"[TMP] {tmp_save}")
     report_lines.append(f"artifacts_count={artifacts_count}")
 
-    # save a preview once per chunk/slide
     did_preview = False
 
     for art in artifacts:
         patch_stem, src_path = artifact_to_patch_stem_and_src(art, sub_pngs)
         if patch_stem is None:
-            # ignore non-index artifacts like file_map.dat
             report_lines.append(f"[SKIP] {art.name} -> cannot map to patch stem")
             continue
-
         mapped_count += 1
 
-        out_path = out_slide_dir / f"{patch_stem}.png"
-        if patch_level_skip and out_path.exists() and (not overwrite):
+        out_bnd = out_bnd_dir / f"{patch_stem}.png"
+        out_msk = out_msk_dir / f"{patch_stem}.png"
+
+        if patch_level_skip and (out_bnd.exists() and out_msk.exists()) and (not overwrite):
             continue
 
         report_lines.append(f"\n[ARTIFACT] {art}")
-        bnd, mode_used = decode_artifact_to_boundary(
+
+        bnd, msk, mode_used = decode_artifact_to_maps(
             artifact_path=art,
             src_patch_path=src_path,
             dilate=dilate,
             report_lines=report_lines,
         )
 
-        if bnd is None:
+        if bnd is None or msk is None:
             failed += 1
             continue
 
@@ -430,15 +469,17 @@ def process_one_chunk(
         elif mode_used == "contour":
             contour_used += 1
 
-        ok = cv2.imwrite(str(out_path), bnd)
-        if ok:
+        ok1 = cv2.imwrite(str(out_bnd), bnd)
+        ok2 = cv2.imwrite(str(out_msk), msk)
+        if ok1 and ok2:
             written += 1
         else:
             failed += 1
 
         if debug_preview and (not did_preview):
             try:
-                cv2.imwrite(str(out_slide_dir / "__debug_boundary_preview.png"), bnd)
+                cv2.imwrite(str(out_bnd_dir / "__debug_boundary_preview.png"), bnd)
+                cv2.imwrite(str(out_msk_dir / "__debug_mask_preview.png"), msk)
             except Exception:
                 pass
             did_preview = True
@@ -473,13 +514,18 @@ def main():
 
     out_img_dir = Path(args.out_img_dir)
     hr_root = out_img_dir / "hr_png"
-    out_root = out_img_dir / "hovernet_boundary_pp"
-    safe_mkdir(out_root)
+
+    out_bnd_root = out_img_dir / "hovernet_boundary_png"
+    out_msk_root = out_img_dir / "hovernet_nucmask_png"
+
+    safe_mkdir(out_bnd_root)
+    safe_mkdir(out_msk_root)
 
     if not hr_root.exists():
         raise FileNotFoundError(f"hr_png not found: {hr_root}")
 
     slide_dirs = list_slide_dirs(hr_root)
+
     seg, ioconfig = build_segmentor(
         pretrained_model=args.pretrained_model,
         batch_size=int(args.batch_size),
@@ -491,7 +537,9 @@ def main():
     patch_level_skip = not bool(args.no_patch_skip)
 
     print(f"[INFO] slides={len(slide_dirs)} model={args.pretrained_model} device={args.device} bs={args.batch_size}")
-    print(f"[INFO] out_root={out_root} predict_chunk={args.predict_chunk} dilate={args.dilate}")
+    print(f"[INFO] out_boundary_root={out_bnd_root}")
+    print(f"[INFO] out_nucmask_root={out_msk_root}")
+    print(f"[INFO] predict_chunk={args.predict_chunk} dilate={args.dilate}")
     print(f"[INFO] keep_tmp={args.keep_tmp} keep_tmp_on_failure={args.keep_tmp_on_failure} overwrite={args.overwrite}")
 
     for sdir in slide_dirs:
@@ -500,16 +548,24 @@ def main():
         if not pngs:
             continue
 
-        out_slide_dir = out_root / slide_id
-        safe_mkdir(out_slide_dir)
-        done_flag = out_slide_dir / ".HOVERNET_DONE"
+        out_bnd_dir = out_bnd_root / slide_id
+        out_msk_dir = out_msk_root / slide_id
+        safe_mkdir(out_bnd_dir)
+        safe_mkdir(out_msk_dir)
+
+        done_flag = out_bnd_dir / ".HOVERNET_DONE"  # use boundary dir for DONE
 
         if skip_if_done and done_flag.exists() and (not args.overwrite):
             print(f"[SKIP] {slide_id} (DONE exists)")
             continue
 
         if args.overwrite:
-            for f in out_slide_dir.glob("*.png"):
+            for f in out_bnd_dir.glob("*.png"):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+            for f in out_msk_dir.glob("*.png"):
                 try:
                     f.unlink()
                 except Exception:
@@ -539,13 +595,20 @@ def main():
             if patch_level_skip and (not args.overwrite):
                 all_exist = True
                 for p in sub_pngs:
-                    if not (out_slide_dir / f"{Path(p).stem}.png").exists():
+                    stem = Path(p).stem
+                    if not (out_bnd_dir / f"{stem}.png").exists():
+                        all_exist = False
+                        break
+                    if not (out_msk_dir / f"{stem}.png").exists():
                         all_exist = False
                         break
                 if all_exist:
                     continue
 
-            tmp_save = make_unique_tmp_dir(out_root, slide_id)
+            tmp_save = make_unique_tmp_dir(out_bnd_root, slide_id)  # tmp in boundary root is fine
+
+            a = m = im = co = w = f = 0
+            report = None
 
             try:
                 a, m, im, co, w, f, report = process_one_chunk(
@@ -553,7 +616,8 @@ def main():
                     ioconfig=ioconfig,
                     sub_pngs=sub_pngs,
                     tmp_save=tmp_save,
-                    out_slide_dir=out_slide_dir,
+                    out_bnd_dir=out_bnd_dir,
+                    out_msk_dir=out_msk_dir,
                     device=args.device,
                     dilate=int(args.dilate),
                     overwrite=bool(args.overwrite),
@@ -579,7 +643,7 @@ def main():
             keep_this = False
             if args.keep_tmp:
                 keep_this = True
-            if args.keep_tmp_on_failure and (totals["written"] == 0):
+            if args.keep_tmp_on_failure and (w == 0):
                 keep_this = True
 
             if keep_this:
@@ -589,11 +653,15 @@ def main():
                 if tmp_save.exists():
                     shutil.rmtree(tmp_save, ignore_errors=True)
 
-        existing_now = len(list(out_slide_dir.glob("*.png")))
+        existing_bnd = len(list(out_bnd_dir.glob("*.png")))
+        existing_msk = len(list(out_msk_dir.glob("*.png")))
+
         atomic_touch(
             done_flag,
             text=(
-                f"done\nexisting_now={existing_now}\n"
+                f"done\n"
+                f"existing_boundary={existing_bnd}\n"
+                f"existing_nucmask={existing_msk}\n"
                 f"artifacts_total={totals['artifacts']}\n"
                 f"mapped_total={totals['mapped']}\n"
                 f"instmap_used_total={totals['instmap_used']}\n"
@@ -605,7 +673,7 @@ def main():
         )
 
         print(
-            f"[DONE] {slide_id} existing_now={existing_now} "
+            f"[DONE] {slide_id} boundary={existing_bnd} nucmask={existing_msk} "
             f"instmap_used={totals['instmap_used']} contour_used={totals['contour_used']} "
             f"written={totals['written']} failed={totals['failed']}"
         )
