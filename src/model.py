@@ -315,11 +315,11 @@ class SRModelConfig:
     loss_alpha: float = 3.0  # pixel-weight strength using W_edge
 
     # gradient consistency
-    lambda_grad: float = 0.2
+    lambda_grad: float = 0.1
     grad_crop: int = 128
 
     # FFT high-pass consistency (Scheme 2)
-    lambda_fft: float = 0.15
+    lambda_fft: float = 0.1
     fft_crop: int = 256              # compute FFT on a random crop for speed
     fft_cutoff_ratio: float = 0.15   # higher => only very high frequencies
     fft_use_logmag: bool = True
