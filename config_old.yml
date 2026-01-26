@@ -1,5 +1,5 @@
 # 用于日志目录命名：logs/<checkpoint>_<timestamp>/
-checkpoint: "INR_SR_Scheme2_v11"
+checkpoint: "INR_SR_Scheme2_v9"
 
 # -----------------------
 # Dataset roots (for CLAM slicing/export)
@@ -55,7 +55,7 @@ data_loader:
 # train.py 会用这些超参构建 SRModelConfig / SRModel
 # -----------------------
 model:
-  # encoder & kernel predictor
+  # INR / kernel predictor
   feat_ch: 64
   pe_bands: 10
   mlp_hidden: 256
@@ -70,48 +70,17 @@ model:
   saliency_ratio: 0.7
   loss_alpha: 3.0
 
-  # gradient consistency (base)
-  lambda_grad: 0.3
-  grad_crop: 192
-
-  # FFT (optional, default建议先关)
-  lambda_fft: 0.0
-  fft_crop: 256
-  fft_cutoff_ratio: 0.15
-  fft_use_logmag: true
-
-  # inference chunking
-  infer_chunk: 8192
-
-  # tau schedule (可选；不写就用默认)
-  tau_start: 1.0
-  tau_end: 0.5
-  tau_warm_epochs: 2
-  tau_anneal_epochs: 8
-
   # residual SR
   use_residual: true
   use_res_refiner: true
 
-  # ----------------------------
-  # HoVer-Net guidance (与你当前 model.py 完全一致的字段名)
-  # ----------------------------
-  use_hover: true
+  # structure / gradient consistency（你提过要引入结构梯度一致性）
+  lambda_grad: 0.1
+  lambda_fft: 0.1
+  grad_crop: 128
 
-  # sampling: mix LR-up edge saliency and HoVer boundary band
-  hover_sample_ratio: 0.7     # 0=只用W_edge; 1=只用hover_bnd
-
-  # soft band widths in HR pixels
-  hover_bnd_sigma: 3.0
-  hover_mask_sigma: 1.5
-
-  # weights used inside loss
-  hover_bnd_weight: 4.0
-  hover_in_weight: 0.8
-
-  # extra losses (关键：防止“只画边界”)
-  lambda_hover_grad: 1.0
-  lambda_in_gray: 0.08
+  # inference chunking
+  infer_chunk: 8192
 
 # -----------------------
 # Trainer settings

@@ -705,12 +705,14 @@ if __name__ == "__main__":
     for batch in val_loader:
         print(batch["lr"])
         print(batch["hr"])
-        print(batch["hover"])
+        print(batch["hover_bnd"])
+        print(batch["hover_mask"])
         print(batch["time"])
     
     for batch in test_loader:
         print(batch["lr"])
         print(batch["hr"])
-        print(batch["hover"])
+        print(batch["hover_bnd"])
+        print(batch["hover_mask"])
         print(batch["time"])
     
