@@ -1,5 +1,5 @@
 # 用于日志目录命名：logs/<checkpoint>_<timestamp>/
-checkpoint: "INR_SR_Scheme2_v12"
+checkpoint: "INR_SR_Scheme2_v13"
 
 # -----------------------
 # Dataset roots (for CLAM slicing/export)

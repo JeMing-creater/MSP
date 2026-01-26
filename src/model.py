@@ -648,10 +648,17 @@ class SRModel(nn.Module):
         hr_xy_int: torch.Tensor,
         hr_hw: Tuple[int, int],
         feat_lr: Optional[torch.Tensor] = None,
+        lr_up: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Base SR at points using dynamic kernel.
-        Returns [B,N,3] in [0,1]
+        Predict RESIDUAL at HR points using dynamic kernel.
+
+        Returns:
+            residual_pts: [B,N,3]  (can be negative), where
+                residual = sr_rgb - lr_up_rgb_at_points
+        Notes:
+            - lr_up should be bicubic-upsampled LR to HR size for consistency with training target (hr - lr_up).
+            - If lr_up is None, it will be computed internally (bicubic).
         """
         B, _, H_lr, W_lr = lr.shape
         H_hr, W_hr = hr_hw
@@ -659,7 +666,10 @@ class SRModel(nn.Module):
         if feat_lr is None:
             feat_lr = self.encoder(lr)
 
+        # Ensure hr_xy_int is float32 but represents integer coords
         hr_xy_int = hr_xy_int.to(device=lr.device, dtype=torch.float32)
+
+        # --- SR RGB prediction at points (0~1) ---
         hr_xy_norm = _hr_int_to_hr_norm(hr_xy_int, H_hr, W_hr)  # [N,2]
         lr_xy_cont, lr_frac, lr_xy_norm_center = self._lr_continuous_from_hr_int(
             hr_xy_int=hr_xy_int, lr_hw=(H_lr, W_lr), hr_hw=(H_hr, W_hr)
@@ -668,9 +678,31 @@ class SRModel(nn.Module):
         w = self._predict_kernel_weights(feat_lr, hr_xy_norm, lr_xy_norm_center, lr_frac)  # [B,N,K]
         offsets = self._kernel_offsets.to(device=lr.device, dtype=torch.float32)
         rgb = self._sample_lr_rgb_neighbors(lr, lr_xy_cont, offsets)  # [B,N,K,3]
+        sr_rgb_pts = (w.unsqueeze(-1) * rgb).sum(dim=2).clamp(0, 1)    # [B,N,3] in [0,1]
 
-        sr_base = (w.unsqueeze(-1) * rgb).sum(dim=2).clamp(0, 1)
-        return sr_base
+        # --- Bicubic LR-up at HR points (0~1) ---
+        if lr_up is None:
+            lr_up = F.interpolate(lr, size=(H_hr, W_hr), mode="bicubic", align_corners=False).clamp(0, 1)
+        else:
+            # safety: ensure correct size and range
+            if lr_up.shape[-2:] != (H_hr, W_hr):
+                lr_up = F.interpolate(lr_up, size=(H_hr, W_hr), mode="bicubic", align_corners=False).clamp(0, 1)
+            else:
+                lr_up = lr_up.clamp(0, 1)
+
+        # gather lr_up rgb at those integer points
+        # hr_xy_int are integer coords in float; round & clamp for safety
+        xy = torch.round(hr_xy_int).to(dtype=torch.long)
+        x = xy[:, 0].clamp(0, W_hr - 1)
+        y = xy[:, 1].clamp(0, H_hr - 1)
+        idx = (y * W_hr + x)  # [N]
+
+        lr_up_flat = lr_up.permute(0, 2, 3, 1).reshape(B, -1, 3)  # [B,HW,3]
+        lr_up_pts = lr_up_flat[:, idx, :]  # [B,N,3]
+
+        # --- residual ---
+        residual_pts = sr_rgb_pts - lr_up_pts  # can be negative
+        return residual_pts
 
     # ----------------------------
     # full SR image (inference)
@@ -683,46 +715,56 @@ class SRModel(nn.Module):
         hover_bnd: Optional[torch.Tensor] = None,
         hover_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Inference: SR = lr_up + residual (predicted by dynamic kernel).
+        Final output uses hard color-preserving fusion.
+        """
         B, _, H_lr, W_lr = lr.shape
         if out_hw is None:
             out_hw = (H_lr * self.cfg.scale, W_lr * self.cfg.scale)
         H_hr, W_hr = out_hw
 
+        # bicubic upsample baseline
         lr_up = F.interpolate(lr, size=(H_hr, W_hr), mode="bicubic", align_corners=False).clamp(0, 1)
+
+        # student feature (no hover condition in inference)
         feat_lr = self.encoder(lr)
 
+        # HR grid
         hr_xy_int_full = _make_hr_int_grid(H_hr, W_hr, device=lr.device, dtype=torch.float32)
         N = hr_xy_int_full.shape[0]
         chunk = int(self.cfg.infer_chunk)
 
+        # predict residual in chunks
         outs = []
         for st in range(0, N, chunk):
             ed = min(N, st + chunk)
-            sr_pts = self.predict_points_base(
+            res_pts = self.predict_points_base(
                 lr=lr,
                 hr_xy_int=hr_xy_int_full[st:ed],
                 hr_hw=(H_hr, W_hr),
                 feat_lr=feat_lr,
-            )
-            outs.append(sr_pts)
+                lr_up=lr_up,  # IMPORTANT: consistent residual definition
+            )  # [B, n, 3]
+            outs.append(res_pts)
 
-        sr_base = torch.cat(outs, dim=1).transpose(1, 2).contiguous().view(B, 3, H_hr, W_hr).clamp(0, 1)
+        res_map = torch.cat(outs, dim=1).transpose(1, 2).contiguous().view(B, 3, H_hr, W_hr)  # residual map
 
-        # --- Scheme B: hard color-preserving fusion ---
-        # if use_residual: still allow residual/refiner to enhance details, but final output is fused.
+        # optional residual refiner
         if self.cfg.use_residual:
-            res0 = sr_base - lr_up
+            res0 = res_map
             if self.res_refiner is not None:
                 res = self.res_refiner(lr_up, res0)
             else:
                 res = res0
             sr_pred = (lr_up + res).clamp(0, 1)
         else:
-            sr_pred = sr_base
+            sr_pred = (lr_up + res_map).clamp(0, 1)
 
         # Final: keep color from lr_up, inject only luminance residual from sr_pred
         sr_final = _fuse_keep_color(lr_up, sr_pred)
         return sr_final
+
 
     def forward(
         self,
@@ -876,7 +918,13 @@ class SRModel(nn.Module):
         # ----------------------------
         # Helper: predict SR crop given feat
         # ----------------------------
+        
         def _predict_sr_crop(b: int, top: int, left: int, crop: int, feat_lr: torch.Tensor) -> torch.Tensor:
+            """
+            Predict SR crop using residual definition:
+            residual = predict_points_base(..., lr_up=lr_up)
+            sr = lr_up + residual
+            """
             lr_up_crop = lr_up[b:b + 1, :, top:top + crop, left:left + crop]
 
             ys = torch.arange(top, top + crop, device=lr.device)
@@ -884,24 +932,31 @@ class SRModel(nn.Module):
             yy, xx = torch.meshgrid(ys, xs, indexing="ij")
             hr_xy_crop = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1).to(torch.float32)
 
-            res_map_pts = self.predict_points_base(
+            # IMPORTANT: this now returns RESIDUAL points
+            res_pts = self.predict_points_base(
                 lr=lr[b:b + 1],
                 hr_xy_int=hr_xy_crop,
                 hr_hw=(H_hr, W_hr),
                 feat_lr=feat_lr[b:b + 1],
-            )
-            res_map = res_map_pts.transpose(1, 2).contiguous().view(1, 3, crop, crop)
+                lr_up=lr_up[b:b + 1],   # consistent residual baseline
+            )  # [1, crop*crop, 3]
 
+            res_map = res_pts.transpose(1, 2).contiguous().view(1, 3, crop, crop)
+
+            # base SR from residual
             sr_pred = (lr_up_crop + res_map).clamp(0, 1)
 
+            # optional residual refiner (still outputs residual)
             if self.cfg.use_residual and (self.res_refiner is not None):
-                res0 = (sr_pred - lr_up_crop)
+                res0 = res_map
                 res = self.res_refiner(lr_up_crop, res0)
                 sr_pred = (lr_up_crop + res).clamp(0, 1)
 
+            # hard color-preserving fusion
             sr_crop = _fuse_keep_color(lr_up_crop, sr_pred)
             return sr_crop
 
+        
         # ----------------------------
         # Gradient consistency (student)
         # ----------------------------
