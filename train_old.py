@@ -217,13 +217,7 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
 
         optimizer.zero_grad(set_to_none=True)
 
-        loss, dbg = model.compute_loss(
-                lr,
-                hr,
-                hover_bnd=batch.get("hover_bnd"),
-                hover_mask=batch.get("hover_mask"),
-                return_debug=True,
-            )
+        loss, dbg = model.compute_loss(lr, hr, return_debug=True)
 
         accelerator.backward(loss)
 
@@ -239,17 +233,12 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
 
         pix = float(dbg.get("loss_pix", 0.0))
         grad = float(dbg.get("loss_grad", 0.0))
-        fft  = float(dbg.get("loss_fft", 0.0))
+        fft = float(dbg.get("loss_fft", 0.0))
 
-        hb   = float(dbg.get("loss_hover_bnd", 0.0))
-        hm   = float(dbg.get("loss_hover_mask", 0.0))
+        lam_g = float(dbg.get("lambda_grad", 0.0))
+        lam_f = float(dbg.get("lambda_fft", 0.0))
 
-        lam_g  = float(dbg.get("lambda_grad", 0.0))
-        lam_f  = float(dbg.get("lambda_fft", 0.0))
-        lam_hb = float(dbg.get("lambda_hover_bnd", 0.0))
-        lam_hm = float(dbg.get("lambda_hover_mask", 0.0))
-
-        edge = lam_g * grad + lam_f * fft + lam_hb * hb + lam_hm * hm
+        edge = lam_g * grad + lam_f * fft
 
         run_total += total
         run_pix += pix
