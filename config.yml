@@ -1,5 +1,5 @@
 # 用于日志目录命名：logs/<checkpoint>_<timestamp>/
-checkpoint: "INR_SR_Scheme2_v13"
+checkpoint: "INR_SR_Scheme2_V15"
 
 # -----------------------
 # Dataset roots (for CLAM slicing/export)
@@ -68,12 +68,22 @@ model:
   kernel_size: 7
   kernel_allow_negative: true
 
+  # =====================================================
+  # Multi-head dynamic kernel (S4)
+  # =====================================================
+  kernel_heads: 4
+  kernel_gate_tau: 1.0
+  kernel_logit_norm: true
+
+  # =====================================================
+  # Training sampling
+  # =====================================================
   num_points: 4096
   saliency_ratio: 0.7
   loss_alpha: 3.0
 
   # =====================================================
-  # Residual SR & color preservation
+  # Residual SR
   # =====================================================
   use_residual: true
   use_res_refiner: true
@@ -83,14 +93,6 @@ model:
   # =====================================================
   lambda_grad: 0.1
   grad_crop: 128
-
-  # =====================================================
-  # FFT consistency (optional, default off)
-  # =====================================================
-  lambda_fft: 0.0
-  fft_crop: 256
-  fft_cutoff_ratio: 0.15
-  fft_use_logmag: true
 
   # =====================================================
   # Inference chunking
@@ -112,15 +114,18 @@ model:
 
   hover_sample_ratio: 0.5
   hover_bnd_sigma: 2.0
-  hover_mask_sigma: 1.5
+  hover_mask_sigma: 1.5   # NOTE: 原来 hover_in_sigma 改为这个
+
   hover_bnd_weight: 2.0
   hover_in_weight: 0.5
 
   lambda_hover_grad: 0.2
   lambda_in_gray: 0.05
 
+  in_gray_crop: 192
+
   # =====================================================
-  # HoVer condition injection (TRAIN ONLY, Scheme C)
+  # HoVer condition injection (TRAIN ONLY)
   # =====================================================
   use_hover_cond: true
   hover_cond_bnd: true
@@ -129,15 +134,26 @@ model:
   hover_cond_strength: 1.0
   hover_cond_blur_lr: 0.0
 
-  # condition dropout: crucial for validation without hover
   hover_cond_dropout: 0.5
 
   # =====================================================
-  # Teacher–Student consistency (core sharpening driver)
+  # Teacher–Student consistency (EMA teacher + schedule)
   # =====================================================
+  use_ema_teacher: true
+  ema_decay: 0.999
+  ema_update_every: 1
+
   lambda_cond_consistency: 0.15
   cond_consistency_crop: 192
   cond_consistency_hp_sigma: 1.5
+
+  distill_warmup_epochs: 10
+  distill_ramp_epochs: 10
+
+  # =====================================================
+  # Diagnostics (optional)
+  # =====================================================
+  diag_kernel_points: 256
 
 
 # -----------------------

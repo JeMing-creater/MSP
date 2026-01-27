@@ -118,79 +118,7 @@ def _fuse_keep_color(lr_up: torch.Tensor, sr_pred: torch.Tensor) -> torch.Tensor
     sr_final = (lr_up + delta.repeat(1, 3, 1, 1)).clamp(0, 1)
     return sr_final
 
-# =============================================================================
-# FFT high-pass loss
-# =============================================================================
-def _fft_highpass_mask(h: int, w: int, cutoff_ratio: float, device: torch.device) -> torch.Tensor:
-    """
-    Create a radial high-pass mask in frequency domain (fftshifted layout).
-    cutoff_ratio: in (0,0.5). Frequencies with radius >= cutoff are kept.
-    Returns mask [1,1,H,W] float.
-    """
-    cutoff_ratio = float(cutoff_ratio)
-    cutoff_ratio = max(0.0, min(0.5, cutoff_ratio))
 
-    yy = torch.arange(h, device=device).float()
-    xx = torch.arange(w, device=device).float()
-    Y, X = torch.meshgrid(yy, xx, indexing="ij")
-
-    cy = (h - 1) / 2.0
-    cx = (w - 1) / 2.0
-    r = torch.sqrt((Y - cy) ** 2 + (X - cx) ** 2)
-
-    # FIX: r_max should be float via math.sqrt (not torch.sqrt on floats)
-    r_max = math.sqrt(cy * cy + cx * cx) + 1e-6
-    r_norm = r / r_max
-
-    mask = (r_norm >= cutoff_ratio).float()
-    return mask.view(1, 1, h, w)
-
-
-def _fftshift2(x: torch.Tensor) -> torch.Tensor:
-    """2D fftshift for last two dims."""
-    h, w = x.shape[-2], x.shape[-1]
-    return torch.roll(torch.roll(x, shifts=h // 2, dims=-2), shifts=w // 2, dims=-1)
-
-
-def fft_highpass_l1(
-    sr: torch.Tensor,
-    hr: torch.Tensor,
-    cutoff_ratio: float = 0.15,
-    use_logmag: bool = True,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """
-    SR/HR: [B,3,H,W] in [0,1]
-    Compute L1 distance between high-frequency magnitude spectra (grayscale).
-    """
-    sr_g = _rgb_to_gray(sr).clamp(0, 1)
-    hr_g = _rgb_to_gray(hr).clamp(0, 1)
-
-    # remove DC bias: improves stability
-    sr_g = sr_g - sr_g.mean(dim=(2, 3), keepdim=True)
-    hr_g = hr_g - hr_g.mean(dim=(2, 3), keepdim=True)
-
-    # fft2 -> complex
-    F_sr = torch.fft.fft2(sr_g, dim=(-2, -1))
-    F_hr = torch.fft.fft2(hr_g, dim=(-2, -1))
-
-    # shift to center
-    F_sr = _fftshift2(F_sr)
-    F_hr = _fftshift2(F_hr)
-
-    mag_sr = torch.abs(F_sr)
-    mag_hr = torch.abs(F_hr)
-
-    if use_logmag:
-        mag_sr = torch.log1p(mag_sr + eps)
-        mag_hr = torch.log1p(mag_hr + eps)
-
-    B, _, H, W = mag_sr.shape
-    mask = _fft_highpass_mask(H, W, cutoff_ratio=cutoff_ratio, device=mag_sr.device)  # [1,1,H,W]
-
-    diff = (mag_sr - mag_hr).abs() * mask
-    denom = mask.mean().clamp_min(1e-6)
-    return diff.mean() / denom
 
 
 # =============================================================================
@@ -243,7 +171,12 @@ class LocalEncoder(nn.Module):
 # =============================================================================
 class KernelMLP(nn.Module):
     """
-    input = [local_feat(center), PE(hr_xy_norm), lr_frac(dx,dy)] -> kernel_logits (K*K)
+    Multi-head kernel predictor.
+
+    input = [local_feat(center), PE(hr_xy_norm), lr_frac(dx,dy)]
+    output:
+      - kernel_logits: [*, heads, K*K]
+      - gate_logits:   [*, heads]  (mixture weights over heads)
     """
     def __init__(
         self,
@@ -252,21 +185,28 @@ class KernelMLP(nn.Module):
         kernel_size: int = 7,
         hidden: int = 256,
         depth: int = 5,
+        num_heads: int = 4,
     ):
         super().__init__()
         self.kernel_size = int(kernel_size)
-        out_dim = self.kernel_size * self.kernel_size
+        self.num_heads = int(num_heads)
+        K2 = self.kernel_size * self.kernel_size
         in_dim = int(feat_dim + pe_dim + 2)
 
         layers = [nn.Linear(in_dim, hidden), nn.GELU()]
         for _ in range(depth - 1):
             layers += [nn.Linear(hidden, hidden), nn.GELU()]
-        layers += [nn.Linear(hidden, out_dim)]
-        self.net = nn.Sequential(*layers)
+        self.backbone = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        # heads * K2 kernel logits + heads gate logits
+        self.head_kernel = nn.Linear(hidden, self.num_heads * K2)
+        self.head_gate = nn.Linear(hidden, self.num_heads)
 
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.backbone(x)  # [*, hidden]
+        klogits = self.head_kernel(h)  # [*, heads*K2]
+        glogits = self.head_gate(h)    # [*, heads]
+        return klogits, glogits
 
 # =============================================================================
 # Optional residual refiner (color-safe groups=3)
@@ -298,6 +238,9 @@ class ResidualRefiner(nn.Module):
 # =============================================================================
 @dataclass
 class SRModelConfig:
+    # ----------------------------
+    # Basic SR
+    # ----------------------------
     scale: int = 4
 
     # encoder & kernel predictor
@@ -308,27 +251,28 @@ class SRModelConfig:
 
     # kernel prediction
     kernel_size: int = 7  # odd
+    kernel_allow_negative: bool = True
 
+    # ----------------------------
+    # Multi-head dynamic kernel (S4)
+    # ----------------------------
+    kernel_heads: int = 4            # number of kernel heads
+    kernel_gate_tau: float = 1.0     # softmax temperature for head-gate
+    kernel_logit_norm: bool = True   # normalize logits before softmax/tanh to reduce saturation
+
+    # ----------------------------
     # training sampling
+    # ----------------------------
     num_points: int = 4096
     saliency_ratio: float = 0.7
     loss_alpha: float = 3.0  # pixel-weight strength using W_edge (and optionally HoVer band)
 
-    # gradient consistency
+    # gradient consistency (base)
     lambda_grad: float = 0.1
     grad_crop: int = 128
 
-    # FFT high-pass consistency (Scheme 2) - default OFF
-    lambda_fft: float = 0.0
-    fft_crop: int = 256              # compute FFT on a random crop for speed
-    fft_cutoff_ratio: float = 0.15   # higher => only very high frequencies
-    fft_use_logmag: bool = True
-
     # inference chunking
     infer_chunk: int = 8192
-
-    # kernel weight mode
-    kernel_allow_negative: bool = True
 
     # temperature annealing (tau)
     tau_start: float = 1.0
@@ -346,11 +290,15 @@ class SRModelConfig:
     use_hover: bool = True
     hover_sample_ratio: float = 0.5
     hover_bnd_sigma: float = 2.0
-    hover_mask_sigma: float = 1.5
+    hover_mask_sigma: float = 1.5   # NOTE: 统一命名（原 yaml 里是 hover_in_sigma）
+
     hover_bnd_weight: float = 2.0
     hover_in_weight: float = 0.5
+
     lambda_hover_grad: float = 0.2
     lambda_in_gray: float = 0.05
+
+    in_gray_crop: int = 192
 
     # ----------------------------
     # HoVer-Net condition injection (train-time teacher)
@@ -363,12 +311,26 @@ class SRModelConfig:
     hover_cond_blur_lr: float = 0.0
 
     # condition dropout (applied to teacher condition during training for robustness)
-    hover_cond_dropout: float = 0.0
+    hover_cond_dropout: float = 0.5
 
+    # ----------------------------
     # Consistency distillation: student (no hover) learns from teacher (with hover)
-    lambda_cond_consistency: float = 0.1
+    # ----------------------------
+    use_ema_teacher: bool = True
+    ema_decay: float = 0.999
+    ema_update_every: int = 1
+
+    lambda_cond_consistency: float = 0.15
     cond_consistency_crop: int = 192
     cond_consistency_hp_sigma: float = 1.5
+
+    distill_warmup_epochs: int = 10
+    distill_ramp_epochs: int = 10
+
+    # ----------------------------
+    # Diagnostics (optional)
+    # ----------------------------
+    diag_kernel_points: int = 256
 
 # =============================================================================
 # Main SR Model
@@ -384,12 +346,18 @@ class SRModel(nn.Module):
         self.pe = FourierPositionalEncoding(num_bands=self.cfg.pe_bands)
         pe_dim = 4 * self.cfg.pe_bands
 
+        # --------- Multi-head kernel predictor (S4) ----------
+        self.kernel_heads = int(getattr(self.cfg, "kernel_heads", 4))
+        if self.kernel_heads < 1:
+            self.kernel_heads = 1
+
         self.kernel_mlp = KernelMLP(
             feat_dim=self.cfg.feat_ch,
             pe_dim=pe_dim,
             kernel_size=self.cfg.kernel_size,
             hidden=self.cfg.mlp_hidden,
             depth=self.cfg.mlp_depth,
+            num_heads=self.kernel_heads,
         )
 
         self.res_refiner = ResidualRefiner() if self.cfg.use_res_refiner else None
@@ -412,7 +380,6 @@ class SRModel(nn.Module):
         else:
             self.cond_fuser = None
 
-
         # kernel offsets (K*K)
         r = self.cfg.kernel_size // 2
         offsets = [(ox, oy) for oy in range(-r, r + 1) for ox in range(-r, r + 1)]
@@ -422,12 +389,26 @@ class SRModel(nn.Module):
         self._epoch = 0
         self._tau = float(self.cfg.tau_start)
 
+        # ---------------------------------------------------
+        # EMA Teacher: keep EMA shadow on CPU float32 ALWAYS
+        # ---------------------------------------------------
+        self._use_ema_teacher = bool(getattr(self.cfg, "use_ema_teacher", True))
+        self._ema_decay = float(getattr(self.cfg, "ema_decay", 0.999))
+        self._ema_update_every = int(getattr(self.cfg, "ema_update_every", 1))
+        self._ema_step = 0
+
+        # name -> CPU float32 tensor
+        self._ema_shadow = {}
+        if self._use_ema_teacher:
+            for n, p in self.named_parameters():
+                if p.requires_grad:
+                    self._ema_shadow[n] = p.detach().to(device="cpu", dtype=torch.float32).clone()
+
     # ----------------------------
     # temperature schedule
     # ----------------------------
     def set_epoch(self, epoch: int):
         self._epoch = int(epoch)
-        self._tau = float(self._compute_tau(self._epoch))
 
     def _compute_tau(self, epoch: int) -> float:
         s = float(self.cfg.tau_start)
@@ -602,20 +583,32 @@ class SRModel(nn.Module):
     # kernel weights with tau
     # ----------------------------
     def _kernel_weights_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        logits: [..., K2]
+        return: [..., K2]  (sum=1, non-negative if kernel_allow_negative=False)
+        """
+        # optional: normalize logits per-point to avoid softmax saturation (structural, no extra loss)
+        if bool(getattr(self.cfg, "kernel_logit_norm", True)):
+            m = logits.mean(dim=-1, keepdim=True)
+            s = logits.std(dim=-1, keepdim=True).clamp_min(1e-6)
+            logits = (logits - m) / s
+
         tau = float(self._tau)
         logits = logits / max(tau, 1e-6)
 
         if not self.cfg.kernel_allow_negative:
             return torch.softmax(logits, dim=-1)
 
-        w = torch.tanh(logits)  # no inplace
-        K = w.shape[-1]
-        center = K // 2
-        oh = F.one_hot(torch.tensor(center, device=w.device), num_classes=K).to(w.dtype)
-        w = w + oh.view(1, 1, K)  # add identity bias
+        # allow negative weights branch (keep your original behavior)
+        w = torch.tanh(logits)
+        K2 = w.shape[-1]
+        center = K2 // 2
+        oh = F.one_hot(torch.tensor(center, device=w.device), num_classes=K2).to(w.dtype)
+        w = w + oh.view(*([1] * (w.ndim - 1)), K2)  # add identity bias (broadcast)
         w = w / (w.sum(dim=-1, keepdim=True) + 1e-6)
         return w
 
+    
     def _predict_kernel_weights(
         self,
         feat_lr: torch.Tensor,
@@ -623,10 +616,16 @@ class SRModel(nn.Module):
         lr_xy_norm_center: torch.Tensor,
         lr_frac: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Return fused kernel weights: [B, N, K2]
+        using multi-head mixture: w = sum_h softmax(gate)_h * w_h
+        """
         B = feat_lr.shape[0]
         N = hr_xy_norm.shape[0]
-        K = self.cfg.kernel_size * self.cfg.kernel_size
+        K2 = self.cfg.kernel_size * self.cfg.kernel_size
+        H = int(getattr(self, "kernel_heads", 1))
 
+        # center feature sampling
         grid = lr_xy_norm_center.view(1, 1, -1, 2).to(feat_lr.device).repeat(B, 1, 1, 1)
         cen = F.grid_sample(feat_lr, grid, mode="bilinear", align_corners=False)  # [B,C,1,N]
         cen = cen.squeeze(2).transpose(1, 2).contiguous()  # [B,N,C]
@@ -636,9 +635,25 @@ class SRModel(nn.Module):
         frac = lr_frac.to(device=feat_lr.device, dtype=torch.float32).unsqueeze(0).expand(B, -1, -1)
 
         inp = torch.cat([cen, pe, frac], dim=-1)  # [B,N,D]
-        logits = self.kernel_mlp(inp.view(B * N, -1)).view(B, N, K)
-        return self._kernel_weights_from_logits(logits)
+        inp2 = inp.view(B * N, -1)
 
+        # multi-head outputs
+        klogits_flat, glogits_flat = self.kernel_mlp(inp2)  # [B*N, H*K2], [B*N, H]
+        klogits = klogits_flat.view(B, N, H, K2)
+        glogits = glogits_flat.view(B, N, H)
+
+        # per-head kernel weights
+        w_head = self._kernel_weights_from_logits(klogits.view(B, N * H, K2)).view(B, N, H, K2)
+
+        # head mixing weights (softmax over heads)
+        gate_tau = float(getattr(self.cfg, "kernel_gate_tau", 1.0))
+        gate = torch.softmax(glogits / max(gate_tau, 1e-6), dim=-1)  # [B,N,H]
+        gate = gate.unsqueeze(-1)  # [B,N,H,1]
+
+        w = (gate * w_head).sum(dim=2)  # [B,N,K2]
+        return w
+
+    
     # ----------------------------
     # point prediction
     # ----------------------------
@@ -798,18 +813,31 @@ class SRModel(nn.Module):
         if B != Bh:
             raise ValueError("lr/hr batch size mismatch")
 
+        
+        
+        # tau schedule
         self._tau = float(self._compute_tau(self._epoch))
+
+        # ---------------------------------------------------
+        # EMA update (CPU shadow) - SAFE across devices
+        # ---------------------------------------------------
+        if self.training and getattr(self, "_use_ema_teacher", False) and len(getattr(self, "_ema_shadow", {})) > 0:
+            self._ema_step += 1
+            if (self._ema_step % max(1, int(getattr(self, "_ema_update_every", 1)))) == 0:
+                d = float(getattr(self, "_ema_decay", 0.999))
+                with torch.no_grad():
+                    for n, p in self.named_parameters():
+                        if (n in self._ema_shadow) and p.requires_grad:
+                            cur_cpu = p.detach().to(device="cpu", dtype=torch.float32)
+                            self._ema_shadow[n].mul_(d).add_(cur_cpu, alpha=(1.0 - d))
 
         # ----------------------------
         # Prepare maps (HR space)
         # ----------------------------
         lr_up = F.interpolate(lr, size=(H_hr, W_hr), mode="bicubic", align_corners=False).clamp(0, 1)
-
-        # edge saliency from LR-up (always available)
         W_edge = self.compute_edge_saliency(lr, out_hw=(H_hr, W_hr))  # [B,1,H,W] in [0,1]
 
         def _blur01(m: torch.Tensor, sigma: float) -> torch.Tensor:
-            # m: [B,1,H,W] float in [0,1]
             if sigma <= 0:
                 return m
             k = int(round(sigma * 4 + 1))
@@ -820,6 +848,8 @@ class SRModel(nn.Module):
             return F.avg_pool2d(mp, kernel_size=k, stride=1)
 
         use_hover = bool(getattr(self.cfg, "use_hover", False))
+
+        # boundary soft weight (HR)
         if use_hover and (hover_bnd is not None):
             hb = hover_bnd
             if hb.ndim == 3:
@@ -830,11 +860,12 @@ class SRModel(nn.Module):
             hb = (hb > 0.5).float()
             if hb.shape[-2:] != (H_hr, W_hr):
                 hb = F.interpolate(hb, size=(H_hr, W_hr), mode="nearest")
-            W_bnd_soft = _blur01(hb, float(self.cfg.hover_bnd_sigma))
+            W_bnd_soft = _blur01(hb, float(getattr(self.cfg, "hover_bnd_sigma", 2.0)))
             W_bnd_soft = _minmax_norm(W_bnd_soft)
         else:
             W_bnd_soft = torch.zeros((B, 1, H_hr, W_hr), device=lr.device, dtype=torch.float32)
 
+        # interior soft weight (HR)
         if use_hover and (hover_mask is not None):
             hm = hover_mask
             if hm.ndim == 3:
@@ -845,35 +876,74 @@ class SRModel(nn.Module):
             hm = (hm > 0.5).float()
             if hm.shape[-2:] != (H_hr, W_hr):
                 hm = F.interpolate(hm, size=(H_hr, W_hr), mode="nearest")
-            M_in_soft = _blur01(hm, float(self.cfg.hover_mask_sigma))
-            M_in_soft = _minmax_norm(M_in_soft)
+            W_in_soft = _blur01(hm, float(getattr(self.cfg, "hover_mask_sigma", 1.5)))
+            W_in_soft = _minmax_norm(W_in_soft)
         else:
-            M_in_soft = torch.zeros((B, 1, H_hr, W_hr), device=lr.device, dtype=torch.float32)
+            W_in_soft = torch.zeros((B, 1, H_hr, W_hr), device=lr.device, dtype=torch.float32)
 
-        # mix sampling weight: edge + hover boundary band
-        r = float(getattr(self.cfg, "hover_sample_ratio", 0.0)) if use_hover else 0.0
-        W_mix = (1.0 - r) * W_edge + r * W_bnd_soft
-        W_mix = _minmax_norm(W_mix)
-
-        # ----------------------------
-        # Features: student vs teacher
-        # ----------------------------
-        feat_student = self.encoder(lr)  # validation path
-        feat_teacher = None
-        if bool(getattr(self.cfg, "use_hover_cond", False)) and ((hover_bnd is not None) or (hover_mask is not None)):
-            feat_teacher = self._encode_with_condition(
-                lr, hover_bnd=hover_bnd, hover_mask=hover_mask, apply_dropout=True
-            )
+        # sampling weight mix
+        r = float(getattr(self.cfg, "hover_sample_ratio", 0.5)) if use_hover else 0.0
+        W_mix = _minmax_norm(W_edge + r * W_bnd_soft)  # [B,1,H,W]
 
         # ----------------------------
-        # Pixel loss with saliency-guided sampling (student)
+        # student feature (no hover condition)
         # ----------------------------
-        N = int(self.cfg.num_points)
-        N_sal = int(round(N * float(self.cfg.saliency_ratio)))
+        feat_student = self.encoder(lr)
+
+        # ----------------------------
+        # helpers: predict residual/sr crop from features
+        # ----------------------------
+        def _make_crop_xy_int(top: int, left: int, crop: int) -> torch.Tensor:
+            ys = torch.arange(top, top + crop, device=lr.device)
+            xs = torch.arange(left, left + crop, device=lr.device)
+            yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+            return torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1).to(dtype=torch.float32)
+
+        def _predict_residual_crop(b: int, top: int, left: int, crop: int, feat_lr: torch.Tensor) -> torch.Tensor:
+            hr_xy_int = _make_crop_xy_int(top, left, crop)
+            res_pts = self.predict_points_base(
+                lr=lr[b:b + 1],
+                hr_xy_int=hr_xy_int,
+                hr_hw=(H_hr, W_hr),
+                feat_lr=feat_lr[b:b + 1],
+                lr_up=lr_up[b:b + 1],
+            )  # [1, crop*crop, 3]
+            res_map = res_pts.transpose(1, 2).contiguous().view(1, 3, crop, crop)
+            return res_map
+
+        def _predict_sr_crop(b: int, top: int, left: int, crop: int, feat_lr: torch.Tensor) -> torch.Tensor:
+            lr_up_crop = lr_up[b:b + 1, :, top:top + crop, left:left + crop]
+            res0 = _predict_residual_crop(b, top, left, crop, feat_lr)
+            if bool(getattr(self.cfg, "use_residual", True)):
+                if self.res_refiner is not None:
+                    res = self.res_refiner(lr_up_crop, res0)
+                else:
+                    res = res0
+                sr = (lr_up_crop + res).clamp(0, 1)
+            else:
+                sr = (lr_up_crop + res0).clamp(0, 1)
+
+            # 注意：训练 loss 仍然基于 residual 的点采样；这里 sr_crop 主要用于 grad/hover/consistency
+            return sr
+
+        def _predict_sr_crop_from_residual(b: int, top: int, left: int, crop: int, feat_lr: torch.Tensor) -> torch.Tensor:
+            # same as _predict_sr_crop，但保留这个名字以兼容你之前版本里可能用到的调用习惯
+            return _predict_sr_crop(b, top, left, crop, feat_lr)
+
+        # ----------------------------
+        # Pixel residual loss (sampled points)
+        # ----------------------------
+        N = int(getattr(self.cfg, "num_points", 4096))
+        N_sal = int(round(N * float(getattr(self.cfg, "saliency_ratio", 0.7))))
         N_uni = max(0, N - N_sal)
 
-        loss_pix = 0.0
+        loss_pix = torch.tensor(0.0, device=lr.device)
         mean_edge = 0.0
+
+        # diagnostic accumulators
+        _acc_res_pred_abs = 0.0
+        _acc_res_tgt_abs = 0.0
+        _acc_wmix = 0.0
 
         for b in range(B):
             w_flat = W_mix[b, 0].reshape(-1) + 1e-6
@@ -881,187 +951,143 @@ class SRModel(nn.Module):
 
             idx_sal = torch.multinomial(prob, num_samples=N_sal, replacement=True) if N_sal > 0 else None
             idx_uni = torch.randint(0, H_hr * W_hr, (N_uni,), device=lr.device) if N_uni > 0 else None
-            if idx_sal is None:
-                idx = idx_uni
-            elif idx_uni is None:
-                idx = idx_sal
-            else:
-                idx = torch.cat([idx_sal, idx_uni], dim=0)
+            idx = idx_uni if idx_sal is None else (idx_sal if idx_uni is None else torch.cat([idx_sal, idx_uni], dim=0))
 
             y = torch.div(idx, W_hr, rounding_mode="floor")
             x = idx - y * W_hr
             hr_xy_int = torch.stack([x, y], dim=1).to(dtype=torch.float32, device=lr.device)
 
-            # predict residual at points (student)
             res_pred_pts = self.predict_points_base(
                 lr=lr[b:b + 1],
                 hr_xy_int=hr_xy_int,
                 hr_hw=(H_hr, W_hr),
                 feat_lr=feat_student[b:b + 1],
-            )[0].clamp(-1, 1)  # [N,3]
+                lr_up=lr_up[b:b + 1],
+            )[0]  # [N,3]
 
-            lr_up_pts = _get_points_rgb(lr_up[b], idx)      # [N,3]
-            hr_pts = _get_points_rgb(hr[b], idx)            # [N,3]
-            res_tgt_pts = (hr_pts - lr_up_pts)              # [N,3]
+            lr_up_pts = _get_points_rgb(lr_up[b], idx)
+            hr_pts = _get_points_rgb(hr[b], idx)
+            res_tgt_pts = hr_pts - lr_up_pts
 
-            # weighting
-            ws = _get_points_map(W_mix[b], idx)            # [N]
+            ws = _get_points_map(W_mix[b], idx)
             mean_edge += float(ws.mean().detach().cpu())
-            weight = 1.0 + float(self.cfg.loss_alpha) * ws
+            _acc_wmix += float(ws.mean().detach().cpu())
+
+            alpha = float(getattr(self.cfg, "loss_alpha", 3.0))
+            weight = 1.0 + alpha * ws
 
             l1 = (res_pred_pts - res_tgt_pts).abs().mean(dim=1)  # [N]
             loss_pix = loss_pix + (weight * l1).mean()
+
+            _acc_res_pred_abs += float(res_pred_pts.abs().mean().detach().cpu())
+            _acc_res_tgt_abs += float(res_tgt_pts.abs().mean().detach().cpu())
 
         loss_pix = loss_pix / B
         mean_edge = mean_edge / max(B, 1)
 
         # ----------------------------
-        # Helper: predict SR crop given feat
-        # ----------------------------
-        
-        def _predict_sr_crop(b: int, top: int, left: int, crop: int, feat_lr: torch.Tensor) -> torch.Tensor:
-            """
-            Predict SR crop using residual definition:
-            residual = predict_points_base(..., lr_up=lr_up)
-            sr = lr_up + residual
-            """
-            lr_up_crop = lr_up[b:b + 1, :, top:top + crop, left:left + crop]
-
-            ys = torch.arange(top, top + crop, device=lr.device)
-            xs = torch.arange(left, left + crop, device=lr.device)
-            yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-            hr_xy_crop = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1).to(torch.float32)
-
-            # IMPORTANT: this now returns RESIDUAL points
-            res_pts = self.predict_points_base(
-                lr=lr[b:b + 1],
-                hr_xy_int=hr_xy_crop,
-                hr_hw=(H_hr, W_hr),
-                feat_lr=feat_lr[b:b + 1],
-                lr_up=lr_up[b:b + 1],   # consistent residual baseline
-            )  # [1, crop*crop, 3]
-
-            res_map = res_pts.transpose(1, 2).contiguous().view(1, 3, crop, crop)
-
-            # base SR from residual
-            sr_pred = (lr_up_crop + res_map).clamp(0, 1)
-
-            # optional residual refiner (still outputs residual)
-            if self.cfg.use_residual and (self.res_refiner is not None):
-                res0 = res_map
-                res = self.res_refiner(lr_up_crop, res0)
-                sr_pred = (lr_up_crop + res).clamp(0, 1)
-
-            # hard color-preserving fusion
-            sr_crop = _fuse_keep_color(lr_up_crop, sr_pred)
-            return sr_crop
-
-        
-        # ----------------------------
         # Gradient consistency (student)
         # ----------------------------
-        lam_g = float(self.cfg.lambda_grad)
-        crop_g = int(self.cfg.grad_crop)
+        lam_g = float(getattr(self.cfg, "lambda_grad", 0.1))
         loss_grad = torch.tensor(0.0, device=lr.device)
-
-        if lam_g > 0 and crop_g > 0:
-            crop_g = min(crop_g, H_hr, W_hr)
-            grad_acc = 0.0
+        if lam_g > 0:
+            crop = int(getattr(self.cfg, "grad_crop", 128))
+            crop = min(max(32, crop), H_hr, W_hr)
+            gacc = 0.0
             for b in range(B):
-                top = torch.randint(0, H_hr - crop_g + 1, (1,), device=lr.device).item()
-                left = torch.randint(0, W_hr - crop_g + 1, (1,), device=lr.device).item()
-
-                sr_crop = _predict_sr_crop(b, top, left, crop_g, feat_student)
-                hr_crop = hr[b:b + 1, :, top:top + crop_g, left:left + crop_g]
-                w_crop = W_mix[b:b + 1, :, top:top + crop_g, left:left + crop_g]
-                grad_acc = grad_acc + _image_grad_l1(sr_crop, hr_crop, weight=(1.0 + w_crop))
-            loss_grad = grad_acc / B
+                top = torch.randint(0, H_hr - crop + 1, (1,), device=lr.device).item()
+                left = torch.randint(0, W_hr - crop + 1, (1,), device=lr.device).item()
+                sr_crop = _predict_sr_crop_from_residual(b, top, left, crop, feat_student)
+                hr_crop = hr[b:b + 1, :, top:top + crop, left:left + crop]
+                w_crop = 1.0 + float(getattr(self.cfg, "loss_alpha", 3.0)) * W_edge[b:b + 1, :, top:top + crop, left:left + crop]
+                gacc = gacc + _image_grad_l1(sr_crop, hr_crop, weight=w_crop)
+            loss_grad = gacc / B
 
         # ----------------------------
-        # HoVer boundary grad consistency (student)
+        # HoVer boundary-guided gradient (student)
         # ----------------------------
-        lam_hg = float(getattr(self.cfg, "lambda_hover_grad", 0.0)) if use_hover else 0.0
+        lam_hg = float(getattr(self.cfg, "lambda_hover_grad", 0.2)) if use_hover else 0.0
         loss_hgrad = torch.tensor(0.0, device=lr.device)
-
         if lam_hg > 0:
-            crop_h = min(int(self.cfg.grad_crop), H_hr, W_hr)
-            hacc = 0.0
+            crop = int(getattr(self.cfg, "grad_crop", 128))
+            crop = min(max(32, crop), H_hr, W_hr)
+            hgacc = 0.0
             for b in range(B):
-                # choose crop center biased to boundary band
-                wb = W_bnd_soft[b, 0].reshape(-1)
-                if float(wb.sum().detach().cpu()) > 1e-6:
-                    prob = (wb + 1e-6) / (wb.sum() + 1e-6)
-                    idx0 = int(torch.multinomial(prob, 1, replacement=True).item())
-                    cy = idx0 // W_hr
-                    cx = idx0 - cy * W_hr
-                    top = int(max(0, min(H_hr - crop_h, cy - crop_h // 2)))
-                    left = int(max(0, min(W_hr - crop_h, cx - crop_h // 2)))
-                else:
-                    top = torch.randint(0, H_hr - crop_h + 1, (1,), device=lr.device).item()
-                    left = torch.randint(0, W_hr - crop_h + 1, (1,), device=lr.device).item()
-
-                sr_crop = _predict_sr_crop(b, top, left, crop_h, feat_student)
-                hr_crop = hr[b:b + 1, :, top:top + crop_h, left:left + crop_h]
-                wb_crop = W_bnd_soft[b:b + 1, :, top:top + crop_h, left:left + crop_h]
-                w = 1.0 + float(self.cfg.hover_bnd_weight) * wb_crop
-                hacc = hacc + _image_grad_l1(sr_crop, hr_crop, weight=w)
-            loss_hgrad = hacc / B
+                top = torch.randint(0, H_hr - crop + 1, (1,), device=lr.device).item()
+                left = torch.randint(0, W_hr - crop + 1, (1,), device=lr.device).item()
+                sr_crop = _predict_sr_crop_from_residual(b, top, left, crop, feat_student)
+                hr_crop = hr[b:b + 1, :, top:top + crop, left:left + crop]
+                wb = W_bnd_soft[b:b + 1, :, top:top + crop, left:left + crop]
+                w = 1.0 + float(getattr(self.cfg, "hover_bnd_weight", 2.0)) * wb
+                hgacc = hgacc + _image_grad_l1(sr_crop, hr_crop, weight=w)
+            loss_hgrad = hgacc / B
 
         # ----------------------------
-        # HoVer interior gray consistency (student) to avoid hollow edges
+        # HoVer interior gray consistency (student)
         # ----------------------------
-        lam_in = float(getattr(self.cfg, "lambda_in_gray", 0.0)) if use_hover else 0.0
+        lam_in = float(getattr(self.cfg, "lambda_in_gray", 0.05)) if use_hover else 0.0
         loss_in = torch.tensor(0.0, device=lr.device)
-
         if lam_in > 0:
-            crop_i = min(int(self.cfg.grad_crop), H_hr, W_hr)
+            crop_i = int(getattr(self.cfg, "in_gray_crop", 192))
+            crop_i = min(max(64, crop_i), H_hr, W_hr)
             iacc = 0.0
             for b in range(B):
                 top = torch.randint(0, H_hr - crop_i + 1, (1,), device=lr.device).item()
                 left = torch.randint(0, W_hr - crop_i + 1, (1,), device=lr.device).item()
-
-                sr_crop = _predict_sr_crop(b, top, left, crop_i, feat_student)
+                sr_crop = _predict_sr_crop_from_residual(b, top, left, crop_i, feat_student)
                 hr_crop = hr[b:b + 1, :, top:top + crop_i, left:left + crop_i]
-                mi = M_in_soft[b:b + 1, :, top:top + crop_i, left:left + crop_i]
-                sr_g = _rgb_to_gray(sr_crop)
-                hr_g = _rgb_to_gray(hr_crop)
-                w = 1.0 + float(self.cfg.hover_in_weight) * mi
-                iacc = iacc + (w * (sr_g - hr_g).abs()).mean()
+                w_in = W_in_soft[b:b + 1, :, top:top + crop_i, left:left + crop_i]
+                g_sr = _rgb_to_gray(sr_crop)
+                g_hr = _rgb_to_gray(hr_crop)
+                iacc = iacc + (w_in * (g_sr - g_hr).abs()).mean()
             loss_in = iacc / B
 
         # ----------------------------
-        # FFT high-pass (optional, student)
+        # Distillation: EMA teacher + residual high-pass (student <- teacher)
+        #   - warmup/ramp (A2/C1 style) 用 epoch gating 防止过早把 student 锁死
         # ----------------------------
-        lam_f = float(self.cfg.lambda_fft)
-        crop_f = int(self.cfg.fft_crop)
-        loss_fft = torch.tensor(0.0, device=lr.device)
+        lam_max = float(getattr(self.cfg, "lambda_cond_consistency", 0.0))
+        warm = int(getattr(self.cfg, "distill_warmup_epochs", 10))
+        ramp = int(getattr(self.cfg, "distill_ramp_epochs", 10))
+        if self._epoch < warm:
+            lam_c = 0.0
+        else:
+            if ramp <= 0:
+                lam_c = lam_max
+            else:
+                t = (self._epoch - warm + 1) / float(ramp)
+                lam_c = lam_max * float(max(0.0, min(1.0, t)))
 
-        if lam_f > 0:
-            crop_f = min(max(32, crop_f), H_hr, W_hr)
-            fft_acc = 0.0
-            for b in range(B):
-                top = torch.randint(0, H_hr - crop_f + 1, (1,), device=lr.device).item()
-                left = torch.randint(0, W_hr - crop_f + 1, (1,), device=lr.device).item()
-                sr_crop = _predict_sr_crop(b, top, left, crop_f, feat_student)
-                hr_crop = hr[b:b + 1, :, top:top + crop_f, left:left + crop_f]
-                fft_acc = fft_acc + fft_highpass_l1(
-                    sr=sr_crop,
-                    hr=hr_crop,
-                    cutoff_ratio=float(self.cfg.fft_cutoff_ratio),
-                    use_logmag=bool(self.cfg.fft_use_logmag),
-                )
-            loss_fft = fft_acc / B
-
-        # ----------------------------
-        # Consistency distillation (student <- teacher), crop-biased to boundary
-        # ----------------------------
-        lam_c = float(getattr(self.cfg, "lambda_cond_consistency", 0.0))
         loss_cons = torch.tensor(0.0, device=lr.device)
+        feat_teacher = None
+        dbg_hp_s = 0.0
+        dbg_hp_t = 0.0
 
-        if lam_c > 0 and (feat_teacher is not None):
+        if lam_c > 0 and getattr(self, "_use_ema_teacher", False) and use_hover and (len(getattr(self, "_ema_shadow", {})) > 0) and (hover_bnd is not None or hover_mask is not None):
             crop_c = int(getattr(self.cfg, "cond_consistency_crop", 192))
             crop_c = min(max(64, crop_c), H_hr, W_hr)
             sigma_hp = float(getattr(self.cfg, "cond_consistency_hp_sigma", 1.5))
+
+            def _swap_params_to_ema_cpu_shadow():
+                backup = {}
+                for n, p in self.named_parameters():
+                    if (n in self._ema_shadow) and p.requires_grad:
+                        backup[n] = p.detach().clone()
+                        p.data.copy_(self._ema_shadow[n].to(device=p.device, dtype=p.dtype))
+                return backup
+
+            def _restore_params(backup):
+                for n, p in self.named_parameters():
+                    if (n in backup) and p.requires_grad:
+                        p.data.copy_(backup[n].to(device=p.device, dtype=p.dtype))
+
+            with torch.no_grad():
+                backup = _swap_params_to_ema_cpu_shadow()
+                try:
+                    feat_teacher = self._encode_with_condition(lr, hover_bnd=hover_bnd, hover_mask=hover_mask)
+                finally:
+                    _restore_params(backup)
+
             cacc = 0.0
             for b in range(B):
                 wb = W_bnd_soft[b, 0].reshape(-1)
@@ -1076,21 +1102,101 @@ class SRModel(nn.Module):
                     top = torch.randint(0, H_hr - crop_c + 1, (1,), device=lr.device).item()
                     left = torch.randint(0, W_hr - crop_c + 1, (1,), device=lr.device).item()
 
-                sr_s = _predict_sr_crop(b, top, left, crop_c, feat_student)
-                sr_t = _predict_sr_crop(b, top, left, crop_c, feat_teacher).detach()
+                # student residual crop
+                res_s = _predict_residual_crop(b, top, left, crop_c, feat_student)
+                # teacher residual crop (no grad)
+                with torch.no_grad():
+                    res_t = _predict_residual_crop(b, top, left, crop_c, feat_teacher)
 
-                hp_s = self._gray_highpass(sr_s, sigma=sigma_hp)
-                hp_t = self._gray_highpass(sr_t, sigma=sigma_hp)
+                hp_s = self._gray_highpass(res_s, sigma=sigma_hp)
+                hp_t = self._gray_highpass(res_t, sigma=sigma_hp)
 
-                wb_crop = W_bnd_soft[b:b + 1, :, top:top + crop_c, left:left + crop_c]
-                w = 1.0 + float(self.cfg.hover_bnd_weight) * wb_crop
-                cacc = cacc + (w * (hp_s - hp_t).abs()).mean()
+                dbg_hp_s += float(hp_s.abs().mean().detach().cpu())
+                dbg_hp_t += float(hp_t.abs().mean().detach().cpu())
+
+                w_crop = 1.0 + W_bnd_soft[b:b + 1, :, top:top + crop_c, left:left + crop_c]
+                cacc = cacc + (w_crop * (hp_s - hp_t).abs()).mean()
+
             loss_cons = cacc / B
+            dbg_hp_s /= max(B, 1)
+            dbg_hp_t /= max(B, 1)
 
-        # total
-        loss = loss_pix + lam_g * loss_grad + lam_hg * loss_hgrad + lam_in * loss_in + lam_f * loss_fft + lam_c * loss_cons
+        # ----------------------------
+        # FFT removed completely
+        # ----------------------------
+        loss_fft = torch.tensor(0.0, device=lr.device)
+        lam_f = 0.0
+
+        # ----------------------------
+        # Kernel diagnostics (sample a few points)
+        # ----------------------------
+        dbg_kernel_entropy = 0.0
+        dbg_kernel_center_w = 0.0
+        dbg_kernel_wsum = 0.0
+        dbg_kernel_wmax = 0.0
+        dbg_kernel_wmin = 0.0
+
+        try:
+            diag_n = int(getattr(self.cfg, "diag_kernel_points", 256))
+            diag_n = max(32, min(diag_n, H_hr * W_hr))
+
+            # sample points uniformly for stability
+            idx = torch.randint(0, H_hr * W_hr, (diag_n,), device=lr.device)
+            y = torch.div(idx, W_hr, rounding_mode="floor")
+            x = idx - y * W_hr
+            hr_xy_int = torch.stack([x, y], dim=1).to(dtype=torch.float32, device=lr.device)  # [N,2]
+            hr_xy_norm = _hr_int_to_hr_norm(hr_xy_int, H_hr, W_hr)
+
+            _, lr_frac, lr_xy_norm_center = self._lr_continuous_from_hr_int(
+                hr_xy_int=hr_xy_int, lr_hw=(H_lr, W_lr), hr_hw=(H_hr, W_hr)
+            )
+
+            w = self._predict_kernel_weights(
+                feat_lr=feat_student[0:1],
+                hr_xy_norm=hr_xy_norm,
+                lr_xy_norm_center=lr_xy_norm_center,
+                lr_frac=lr_frac,
+            )  # expected [1,N,K2] but may NOT be a probability distribution
+            
+
+            w0 = w[0]  # [N,K2]
+
+            # --- IMPORTANT: make it a valid probability distribution for diagnostics ---
+            # 1) ensure non-negative
+            w0 = w0.clamp_min(0.0)
+
+            # 2) normalize so sum=1 (avoid cw>1 and invalid entropy)
+            wsum = w0.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            wprob = w0 / wsum  # [N,K2], sum=1
+
+            # entropy: max should be log(K2); for 7x7, log(49) ≈ 3.89
+            ent = (-wprob * torch.log(wprob.clamp_min(1e-12))).sum(dim=-1).mean()
+
+            center_idx = wprob.shape[-1] // 2
+            cw = wprob[:, center_idx].mean()
+
+            dbg_kernel_entropy = float(ent.detach().cpu())
+            dbg_kernel_center_w = float(cw.detach().cpu())
+            dbg_kernel_wsum = float(wprob.sum(dim=-1).mean().detach().cpu())  # should be ~1.0
+            dbg_kernel_wmax = float(wprob.max(dim=-1).values.mean().detach().cpu())
+            dbg_kernel_wmin = float(wprob.min(dim=-1).values.mean().detach().cpu())
+
+        except Exception:
+            pass
+
 
         if return_debug:
+            # ----------------------------
+    # Total loss (define BEFORE return)
+    # ----------------------------
+            loss = (
+                loss_pix
+                + lam_g * loss_grad
+                + lam_hg * loss_hgrad
+                + lam_in * loss_in
+                + lam_f * loss_fft
+                + lam_c * loss_cons
+            )
             return loss, {
                 "loss_pix": float(loss_pix.detach().cpu()),
                 "loss_grad": float(loss_grad.detach().cpu()),
@@ -1100,15 +1206,25 @@ class SRModel(nn.Module):
                 "loss_cons": float(loss_cons.detach().cpu()),
                 "mean_edge": float(mean_edge),
                 "tau": float(self._tau),
-                "lambda_grad": lam_g,
-                "lambda_hover_grad": lam_hg,
-                "lambda_in_gray": lam_in,
-                "lambda_fft": lam_f,
-                "lambda_cond_consistency": lam_c,
+                "lambda_grad": float(lam_g),
+                "lambda_hover_grad": float(lam_hg),
+                "lambda_in_gray": float(lam_in),
+                "lambda_fft": float(lam_f),
+                "lambda_cond_consistency": float(lam_c),
                 "hover_sample_ratio": float(r),
+                # --- diagnostics ---
+                "dbg_res_pred_abs": float(_acc_res_pred_abs / max(B, 1)),
+                "dbg_res_tgt_abs": float(_acc_res_tgt_abs / max(B, 1)),
+                "dbg_wmix_mean": float(_acc_wmix / max(B, 1)),
+                "dbg_kernel_entropy": float(dbg_kernel_entropy),
+                "dbg_kernel_center_w": float(dbg_kernel_center_w),
+                "dbg_hp_stu": float(dbg_hp_s),
+                "dbg_hp_tch": float(dbg_hp_t),
+                "dbg_kernel_wsum": dbg_kernel_wsum,
+                "dbg_kernel_wmax": dbg_kernel_wmax,
+                "dbg_kernel_wmin": dbg_kernel_wmin,
             }
         return loss
-
 
 
 if __name__ == "__main__":

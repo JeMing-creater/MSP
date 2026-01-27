@@ -196,7 +196,7 @@ def save_random_train_visual_to_val_vis(
 def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, epoch: int, config: EasyDict):
     model.train()
 
-    # 若模型内部有 tau / epoch schedule
+    # If model has internal epoch schedule (tau / distill ramp)
     if hasattr(model, "set_epoch") and callable(getattr(model, "set_epoch")):
         try:
             model.set_epoch(epoch)
@@ -209,19 +209,28 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
     run_total = 0.0
     run_pix = 0.0
     run_edge = 0.0
+
     step = 0
 
     for batch in train_loader:
         lr = batch["lr"].to(accelerator.device, non_blocking=True)
         hr = batch["hr"].to(accelerator.device, non_blocking=True)
 
+        # (optional) ensure hover maps on device if present
+        hover_bnd = batch.get("hover_bnd", None)
+        hover_mask = batch.get("hover_mask", None)
+        if torch.is_tensor(hover_bnd):
+            hover_bnd = hover_bnd.to(accelerator.device, non_blocking=True)
+        if torch.is_tensor(hover_mask):
+            hover_mask = hover_mask.to(accelerator.device, non_blocking=True)
+
         optimizer.zero_grad(set_to_none=True)
 
         loss, dbg = model.compute_loss(
             lr,
             hr,
-            hover_bnd=batch.get("hover_bnd"),
-            hover_mask=batch.get("hover_mask"),
+            hover_bnd=hover_bnd,
+            hover_mask=hover_mask,
             return_debug=True,
         )
 
@@ -233,7 +242,7 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
         optimizer.step()
 
         # -------------------------
-        # 统计
+        # aggregate base losses
         # -------------------------
         total = float(loss.detach().item())
 
@@ -258,15 +267,32 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
             lam_f  * fft
         )
 
+        # -------------------------
+        # diagnostics
+        # -------------------------
+        tau  = float(dbg.get("tau", 0.0))
+        res_pred = float(dbg.get("dbg_res_pred_abs", 0.0))
+        res_tgt  = float(dbg.get("dbg_res_tgt_abs", 0.0))
+        wmix     = float(dbg.get("dbg_wmix_mean", 0.0))
+
+        kerH = float(dbg.get("dbg_kernel_entropy", 0.0))
+        cw   = float(dbg.get("dbg_kernel_center_w", 0.0))
+        wsum = float(dbg.get("dbg_kernel_wsum", 0.0))
+        wmax = float(dbg.get("dbg_kernel_wmax", 0.0))
+        wmin = float(dbg.get("dbg_kernel_wmin", 0.0))
+
+        hp_s = float(dbg.get("dbg_hp_stu", 0.0))
+        hp_t = float(dbg.get("dbg_hp_tch", 0.0))
+
+        # -------------------------
+        # running averages
+        # -------------------------
         run_total += total
         run_pix += pix
         run_edge += edge
         step += 1
 
-        # -------------------------
-        # 打印
-        # -------------------------
-        if accelerator.is_local_main_process and step % log_every == 0:
+        if accelerator.is_local_main_process and (step % log_every == 0):
             avg_total = run_total / step
             avg_pix = run_pix / step
             avg_edge = run_edge / step
@@ -279,7 +305,12 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
                 f"[Epoch {epoch}][{step}] "
                 f"total={total:.4f} (avg={avg_total:.4f}) | "
                 f"pix={pix:.4f} ({pix_ratio*100:.1f}%) | "
-                f"edge={edge:.4f} ({edge_ratio*100:.1f}%)"
+                f"edge={edge:.4f} ({edge_ratio*100:.1f}%) || "
+                f"tau={tau:.3f} | "
+                f"res|pred={res_pred:.4f} tgt={res_tgt:.4f} | "
+                f"Wmix={wmix:.3f} | "
+                f"kerH={kerH:.3f} cw={cw:.4f} wsum={wsum:.3f} wmax={wmax:.3f} wmin={wmin:.3f} | "
+                f"hp_s={hp_s:.4f} hp_t={hp_t:.4f}"
             )
 
     return run_total / max(step, 1)
