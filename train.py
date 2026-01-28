@@ -196,7 +196,7 @@ def save_random_train_visual_to_val_vis(
 def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, epoch: int, config: EasyDict):
     model.train()
 
-    # If model has internal epoch schedule (tau / distill ramp)
+    # 若模型内部有 tau / epoch schedule
     if hasattr(model, "set_epoch") and callable(getattr(model, "set_epoch")):
         try:
             model.set_epoch(epoch)
@@ -209,19 +209,18 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
     run_total = 0.0
     run_pix = 0.0
     run_edge = 0.0
-
     step = 0
 
     for batch in train_loader:
         lr = batch["lr"].to(accelerator.device, non_blocking=True)
         hr = batch["hr"].to(accelerator.device, non_blocking=True)
 
-        # (optional) ensure hover maps on device if present
+        # HoVer priors (train-time only)
         hover_bnd = batch.get("hover_bnd", None)
         hover_mask = batch.get("hover_mask", None)
-        if torch.is_tensor(hover_bnd):
+        if hover_bnd is not None:
             hover_bnd = hover_bnd.to(accelerator.device, non_blocking=True)
-        if torch.is_tensor(hover_mask):
+        if hover_mask is not None:
             hover_mask = hover_mask.to(accelerator.device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
@@ -242,56 +241,27 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
         optimizer.step()
 
         # -------------------------
-        # aggregate base losses
+        # running stats
         # -------------------------
         total = float(loss.detach().item())
 
-        pix  = float(dbg.get("loss_pix", 0.0))
-        grad = float(dbg.get("loss_grad", 0.0))
-        hgrad = float(dbg.get("loss_hgrad", 0.0))
-        gin  = float(dbg.get("loss_in", 0.0))
-        cons = float(dbg.get("loss_cons", 0.0))
-        fft  = float(dbg.get("loss_fft", 0.0))
+        # 你原有的 pix/edge 统计逻辑（尽量保持不破坏）
+        pix = float(dbg.get("loss_pix", 0.0))
 
-        lam_g  = float(dbg.get("lambda_grad", 0.0))
-        lam_hg = float(dbg.get("lambda_hover_grad", 0.0))
-        lam_in = float(dbg.get("lambda_in_gray", 0.0))
-        lam_c  = float(dbg.get("lambda_cond_consistency", 0.0))
-        lam_f  = float(dbg.get("lambda_fft", 0.0))
+        # edge = 其余所有项的加权和（如果 dbg 里给了 loss_edge 就优先用它）
+        edge = float(dbg.get("loss_edge", 0.0))
+        if edge <= 0.0:
+            # fallback: 用 total - pix（有些版本更稳）
+            edge = max(0.0, total - pix)
 
-        edge = (
-            lam_g  * grad +
-            lam_hg * hgrad +
-            lam_in * gin +
-            lam_c  * cons +
-            lam_f  * fft
-        )
-
-        # -------------------------
-        # diagnostics
-        # -------------------------
-        tau  = float(dbg.get("tau", 0.0))
-        res_pred = float(dbg.get("dbg_res_pred_abs", 0.0))
-        res_tgt  = float(dbg.get("dbg_res_tgt_abs", 0.0))
-        wmix     = float(dbg.get("dbg_wmix_mean", 0.0))
-
-        kerH = float(dbg.get("dbg_kernel_entropy", 0.0))
-        cw   = float(dbg.get("dbg_kernel_center_w", 0.0))
-        wsum = float(dbg.get("dbg_kernel_wsum", 0.0))
-        wmax = float(dbg.get("dbg_kernel_wmax", 0.0))
-        wmin = float(dbg.get("dbg_kernel_wmin", 0.0))
-
-        hp_s = float(dbg.get("dbg_hp_stu", 0.0))
-        hp_t = float(dbg.get("dbg_hp_tch", 0.0))
-
-        # -------------------------
-        # running averages
-        # -------------------------
         run_total += total
         run_pix += pix
         run_edge += edge
         step += 1
 
+        # -------------------------
+        # print
+        # -------------------------
         if accelerator.is_local_main_process and (step % log_every == 0):
             avg_total = run_total / step
             avg_pix = run_pix / step
@@ -301,16 +271,46 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
             pix_ratio = avg_pix / denom
             edge_ratio = avg_edge / denom
 
+            # --- extra debug (safe get) ---
+            tau = dbg.get("tau", None)
+
+            res_pred_abs = dbg.get("res_pred_abs", None)
+            res_tgt_abs = dbg.get("res_tgt_abs", None)
+
+            Wmix = dbg.get("Wmix_mean", None)
+
+            kerH = dbg.get("ker_entropy", None)
+            cw = dbg.get("ker_center_w", None)
+            wsum = dbg.get("ker_wsum", None)
+            wmax = dbg.get("ker_wmax", None)
+            wmin = dbg.get("ker_wmin", None)
+
+            gateH = dbg.get("gate_entropy", None)
+            gateMax = dbg.get("gate_max", None)
+
+            hp_s = dbg.get("hp_s", None)
+            hp_t = dbg.get("hp_t", None)
+
+            # format helpers
+            def _fmt(x, p=4):
+                if x is None:
+                    return "NA"
+                try:
+                    return f"{float(x):.{p}f}"
+                except Exception:
+                    return "NA"
+
             accelerator.print(
                 f"[Epoch {epoch}][{step}] "
                 f"total={total:.4f} (avg={avg_total:.4f}) | "
                 f"pix={pix:.4f} ({pix_ratio*100:.1f}%) | "
-                f"edge={edge:.4f} ({edge_ratio*100:.1f}%) || "
-                f"tau={tau:.3f} | "
-                f"res|pred={res_pred:.4f} tgt={res_tgt:.4f} | "
-                f"Wmix={wmix:.3f} | "
-                f"kerH={kerH:.3f} cw={cw:.4f} wsum={wsum:.3f} wmax={wmax:.3f} wmin={wmin:.3f} | "
-                f"hp_s={hp_s:.4f} hp_t={hp_t:.4f}"
+                f"edge={edge:.4f} ({edge_ratio*100:.1f}%)"
+                f" || tau={_fmt(tau,3)}"
+                f" | res|pred={_fmt(res_pred_abs,4)} tgt={_fmt(res_tgt_abs,4)}"
+                f" | Wmix={_fmt(Wmix,3)}"
+                f" | kerH={_fmt(kerH,3)} cw={_fmt(cw,4)} wsum={_fmt(wsum,3)} wmax={_fmt(wmax,3)} wmin={_fmt(wmin,3)}"
+                f" | gateH={_fmt(gateH,3)} gateMax={_fmt(gateMax,3)}"
+                f" | hp_s={_fmt(hp_s,4)} hp_t={_fmt(hp_t,4)}"
             )
 
     return run_total / max(step, 1)
