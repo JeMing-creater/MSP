@@ -207,8 +207,9 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
     grad_clip = cfg_get(config, "trainer.grad_clip", None)
 
     run_total = 0.0
-    run_pix = 0.0
-    run_edge = 0.0
+    run_l1 = 0.0
+    run_hp = 0.0
+    run_g = 0.0
     step = 0
 
     for batch in train_loader:
@@ -217,7 +218,7 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
 
         # HoVer priors (train-time only)
         hover_bnd = batch.get("hover_bnd", None)
-        hover_mask = batch.get("hover_mask", None)
+        hover_mask = batch.get("hover_mask", None)  # 兼容保留：新模型可忽略
         if hover_bnd is not None:
             hover_bnd = hover_bnd.to(accelerator.device, non_blocking=True)
         if hover_mask is not None:
@@ -245,18 +246,21 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
         # -------------------------
         total = float(loss.detach().item())
 
-        # 你原有的 pix/edge 统计逻辑（尽量保持不破坏）
-        pix = float(dbg.get("loss_pix", 0.0))
+        # Scheme-1 keys (preferred)
+        l1 = float(dbg.get("loss_crop_l1", 0.0))
+        hp = float(dbg.get("loss_hover_hp", 0.0))
+        gg = float(dbg.get("loss_grad", 0.0))
 
-        # edge = 其余所有项的加权和（如果 dbg 里给了 loss_edge 就优先用它）
-        edge = float(dbg.get("loss_edge", 0.0))
-        if edge <= 0.0:
-            # fallback: 用 total - pix（有些版本更稳）
-            edge = max(0.0, total - pix)
+        # Backward compatibility (old scheme)
+        if (l1 == 0.0) and ("loss_pix" in dbg):
+            l1 = float(dbg.get("loss_pix", 0.0))
+        if (hp == 0.0) and ("loss_edge" in dbg):
+            hp = float(dbg.get("loss_edge", 0.0))
 
         run_total += total
-        run_pix += pix
-        run_edge += edge
+        run_l1 += l1
+        run_hp += hp
+        run_g += gg
         step += 1
 
         # -------------------------
@@ -264,34 +268,15 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
         # -------------------------
         if accelerator.is_local_main_process and (step % log_every == 0):
             avg_total = run_total / step
-            avg_pix = run_pix / step
-            avg_edge = run_edge / step
+            avg_l1 = run_l1 / step
+            avg_hp = run_hp / step
+            avg_g = run_g / step
 
             denom = max(avg_total, 1e-8)
-            pix_ratio = avg_pix / denom
-            edge_ratio = avg_edge / denom
+            l1_ratio = avg_l1 / denom
+            hp_ratio = avg_hp / denom
+            g_ratio = avg_g / denom
 
-            # --- extra debug (safe get) ---
-            tau = dbg.get("tau", None)
-
-            res_pred_abs = dbg.get("res_pred_abs", None)
-            res_tgt_abs = dbg.get("res_tgt_abs", None)
-
-            Wmix = dbg.get("Wmix_mean", None)
-
-            kerH = dbg.get("ker_entropy", None)
-            cw = dbg.get("ker_center_w", None)
-            wsum = dbg.get("ker_wsum", None)
-            wmax = dbg.get("ker_wmax", None)
-            wmin = dbg.get("ker_wmin", None)
-
-            gateH = dbg.get("gate_entropy", None)
-            gateMax = dbg.get("gate_max", None)
-
-            hp_s = dbg.get("hp_s", None)
-            hp_t = dbg.get("hp_t", None)
-
-            # format helpers
             def _fmt(x, p=4):
                 if x is None:
                     return "NA"
@@ -300,17 +285,18 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
                 except Exception:
                     return "NA"
 
+            tau = dbg.get("tau", None)
+            gateH = dbg.get("gate_entropy", None)
+            gateMax = dbg.get("gate_max", None)
+
             accelerator.print(
                 f"[Epoch {epoch}][{step}] "
                 f"total={total:.4f} (avg={avg_total:.4f}) | "
-                f"pix={pix:.4f} ({pix_ratio*100:.1f}%) | "
-                f"edge={edge:.4f} ({edge_ratio*100:.1f}%)"
+                f"l1={l1:.4f} ({l1_ratio*100:.1f}%) | "
+                f"hp={hp:.4f} ({hp_ratio*100:.1f}%) | "
+                f"grad={gg:.4f} ({g_ratio*100:.1f}%)"
                 f" || tau={_fmt(tau,3)}"
-                f" | res|pred={_fmt(res_pred_abs,4)} tgt={_fmt(res_tgt_abs,4)}"
-                f" | Wmix={_fmt(Wmix,3)}"
-                f" | kerH={_fmt(kerH,3)} cw={_fmt(cw,4)} wsum={_fmt(wsum,3)} wmax={_fmt(wmax,3)} wmin={_fmt(wmin,3)}"
                 f" | gateH={_fmt(gateH,3)} gateMax={_fmt(gateMax,3)}"
-                f" | hp_s={_fmt(hp_s,4)} hp_t={_fmt(hp_t,4)}"
             )
 
     return run_total / max(step, 1)
