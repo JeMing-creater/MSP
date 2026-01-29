@@ -5,7 +5,7 @@ import yaml
 import random
 from datetime import datetime
 from pathlib import Path
-os.environ['CUDA_VISIBLE_DEVICES'] = "2"
+os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -196,7 +196,6 @@ def save_random_train_visual_to_val_vis(
 def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, epoch: int, config: EasyDict):
     model.train()
 
-    # 若模型内部有 tau / epoch schedule
     if hasattr(model, "set_epoch") and callable(getattr(model, "set_epoch")):
         try:
             model.set_epoch(epoch)
@@ -208,17 +207,18 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
 
     run_total = 0.0
     run_l1 = 0.0
-    run_hp = 0.0
-    run_g = 0.0
+    run_mask_l1 = 0.0
+    run_hp_bnd = 0.0
+    run_hp_msk = 0.0
+    run_fft = 0.0
     step = 0
 
     for batch in train_loader:
         lr = batch["lr"].to(accelerator.device, non_blocking=True)
         hr = batch["hr"].to(accelerator.device, non_blocking=True)
 
-        # HoVer priors (train-time only)
         hover_bnd = batch.get("hover_bnd", None)
-        hover_mask = batch.get("hover_mask", None)  # 兼容保留：新模型可忽略
+        hover_mask = batch.get("hover_mask", None)
         if hover_bnd is not None:
             hover_bnd = hover_bnd.to(accelerator.device, non_blocking=True)
         if hover_mask is not None:
@@ -241,41 +241,26 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
 
         optimizer.step()
 
-        # -------------------------
-        # running stats
-        # -------------------------
         total = float(loss.detach().item())
-
-        # Scheme-1 keys (preferred)
         l1 = float(dbg.get("loss_crop_l1", 0.0))
-        hp = float(dbg.get("loss_hover_hp", 0.0))
-        gg = float(dbg.get("loss_grad", 0.0))
-
-        # Backward compatibility (old scheme)
-        if (l1 == 0.0) and ("loss_pix" in dbg):
-            l1 = float(dbg.get("loss_pix", 0.0))
-        if (hp == 0.0) and ("loss_edge" in dbg):
-            hp = float(dbg.get("loss_edge", 0.0))
+        mask_l1 = float(dbg.get("loss_mask_l1", 0.0))
+        hp_bnd = float(dbg.get("loss_hp_bnd", 0.0))
+        hp_msk = float(dbg.get("loss_hp_mask", 0.0))
+        fft = float(dbg.get("loss_fft", 0.0))
 
         run_total += total
         run_l1 += l1
-        run_hp += hp
-        run_g += gg
+        run_mask_l1 += mask_l1
+        run_hp_bnd += hp_bnd
+        run_hp_msk += hp_msk
+        run_fft += fft
         step += 1
 
-        # -------------------------
-        # print
-        # -------------------------
         if accelerator.is_local_main_process and (step % log_every == 0):
             avg_total = run_total / step
-            avg_l1 = run_l1 / step
-            avg_hp = run_hp / step
-            avg_g = run_g / step
-
             denom = max(avg_total, 1e-8)
-            l1_ratio = avg_l1 / denom
-            hp_ratio = avg_hp / denom
-            g_ratio = avg_g / denom
+
+            def _ratio(x): return (x / step) / denom * 100.0
 
             def _fmt(x, p=4):
                 if x is None:
@@ -292,9 +277,11 @@ def train_one_epoch(accelerator: Accelerator, model, optimizer, train_loader, ep
             accelerator.print(
                 f"[Epoch {epoch}][{step}] "
                 f"total={total:.4f} (avg={avg_total:.4f}) | "
-                f"l1={l1:.4f} ({l1_ratio*100:.1f}%) | "
-                f"hp={hp:.4f} ({hp_ratio*100:.1f}%) | "
-                f"grad={gg:.4f} ({g_ratio*100:.1f}%)"
+                f"l1={l1:.4f} ({_ratio(run_l1):.1f}%) | "
+                f"maskL1={mask_l1:.4f} ({_ratio(run_mask_l1):.1f}%) | "
+                f"hpB={hp_bnd:.4f} ({_ratio(run_hp_bnd):.1f}%) | "
+                f"hpM={hp_msk:.4f} ({_ratio(run_hp_msk):.1f}%) | "
+                f"fft={fft:.4f} ({_ratio(run_fft):.1f}%)"
                 f" || tau={_fmt(tau,3)}"
                 f" | gateH={_fmt(gateH,3)} gateMax={_fmt(gateMax,3)}"
             )

@@ -1,5 +1,5 @@
 # 用于日志目录命名：logs/<checkpoint>_<timestamp>/
-checkpoint: "INR_SR_Scheme2_V21"
+checkpoint: "INR_SR_Scheme2_V22"
 
 # -----------------------
 # Dataset roots (for CLAM slicing/export)
@@ -55,62 +55,66 @@ data_loader:
 # train.py 会用这些超参构建 SRModelConfig / SRModel
 # -----------------------
 model:
-  # --- 基础结构（保留你当前的设置即可） ---
+  # basics
   feat_ch: 64
   pe_bands: 10
   mlp_hidden: 256
   mlp_depth: 5
-  kernel_size: 7
   kernel_heads: 4
+  kernel_size: 7
   kernel_allow_negative: false
-  infer_chunk: 8192
 
-  # --- kernel 温度退火（保留） ---
+  # refiner (关键：让结果别总像bicubic)
+  use_refiner: true
+  refiner_base: 48
+  refiner_depth: 4
+
+  # dense crop supervision
+  train_crop: 224
+  train_crops_per_img: 2
+  train_crop_chunk: 8192
+  lambda_crop_l1: 1.0
+
+  # hover used as LOSS WEIGHTS ONLY (no inference dependency)
+  use_hover: true
+  hover_bnd_sigma: 2.0
+  hover_mask_sigma: 2.0
+  hover_hp_sigma: 1.2
+
+  lambda_hover_hp_bnd: 0.25
+  lambda_hover_hp_mask: 0.15
+  lambda_mask_l1: 0.25
+
+  # small FFT HF loss (very light)
+  lambda_fft: 0.02
+  fft_hf_ratio: 0.35
+
+  # schedules
   tau_start: 1.0
   tau_end: 0.5
   tau_warm_epochs: 2
   tau_anneal_epochs: 8
 
-  # --- gate 温度（建议先稳定一些；你原来 8->1 很激进） ---
-  kernel_gate_tau_start: 2.0
+  kernel_gate_tau_start: 8.0
   kernel_gate_tau_end: 1.0
-  kernel_gate_tau_warm_steps: 0
-  kernel_gate_tau_anneal_steps: 0
+  kernel_gate_tau_warm_steps: 500
+  kernel_gate_tau_anneal_steps: 3000
 
-  # --- residual/refiner（保留） ---
-  use_residual: true
-  use_res_refiner: true
-
-  # =========================================================
-  # Scheme 1: Dense crop supervision  (新方案核心)
-  # =========================================================
-  train_crop: 192
-  train_crops_per_img: 1
-  train_crop_chunk: 8192
-
-  lambda_crop_l1: 1.0
-  lambda_grad: 0.0
-
-  # =========================================================
-  # Scheme 1: HoVer boundary weighted high-pass (TRAIN ONLY)
-  # =========================================================
-  use_hover: true
-  hover_bnd_sigma: 2.0
-  lambda_hover_hp: 0.2
-  hover_hp_sigma: 1.5
+  infer_chunk: 8192
 
 
 # -----------------------
 # Trainer settings
 # -----------------------
 trainer:
-  epochs: 30
-  batch_size: 8
+  epochs: 80
+  batch_size: 4
   lr: 2.0e-4
   weight_decay: 1.0e-4
   grad_clip: 1.0
   log_every: 50
   use_amp: true
+
 
 # -----------------------
 # Validation / checkpoint / visualization
