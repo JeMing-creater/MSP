@@ -1,5 +1,5 @@
 # 用于日志目录命名：logs/<checkpoint>_<timestamp>/
-checkpoint: "INR_SR_Scheme2_V22"
+checkpoint: "INR_SR_Scheme2_V23"
 
 # -----------------------
 # Dataset roots (for CLAM slicing/export)
@@ -55,7 +55,10 @@ data_loader:
 # train.py 会用这些超参构建 SRModelConfig / SRModel
 # -----------------------
 model:
-  # basics
+  # scale
+  scale: 4
+
+  # backbone / INR kernel predictor
   feat_ch: 64
   pe_bands: 10
   mlp_hidden: 256
@@ -63,52 +66,66 @@ model:
   kernel_heads: 4
   kernel_size: 7
   kernel_allow_negative: false
+  kernel_logit_norm: true
 
-  # refiner (关键：让结果别总像bicubic)
+  # refiner（你现在这版 model.py 支持）
   use_refiner: true
   refiner_base: 48
   refiner_depth: 4
 
-  # dense crop supervision
-  train_crop: 224
-  train_crops_per_img: 2
-  train_crop_chunk: 8192
-  lambda_crop_l1: 1.0
+  # inference chunk
+  infer_chunk: 8192
 
-  # hover used as LOSS WEIGHTS ONLY (no inference dependency)
-  use_hover: true
-  hover_bnd_sigma: 2.0
-  hover_mask_sigma: 2.0
-  hover_hp_sigma: 1.2
-
-  lambda_hover_hp_bnd: 0.25
-  lambda_hover_hp_mask: 0.15
-  lambda_mask_l1: 0.25
-
-  # small FFT HF loss (very light)
-  lambda_fft: 0.02
-  fft_hf_ratio: 0.35
-
-  # schedules
+  # tau schedules
   tau_start: 1.0
   tau_end: 0.5
   tau_warm_epochs: 2
   tau_anneal_epochs: 8
 
+  # gate tau schedules（你 model.py 里有这套）
   kernel_gate_tau_start: 8.0
   kernel_gate_tau_end: 1.0
   kernel_gate_tau_warm_steps: 500
   kernel_gate_tau_anneal_steps: 3000
 
-  infer_chunk: 8192
+  # training: dense crop (Strategy 1)
+  # 目标：增强局部细节学习；同时配合 batch_size 降低显存压力
+  train_crop: 256
+  train_crops_per_img: 2
+  train_crop_chunk: 4096
+  lambda_crop_l1: 1.0
+
+  # hover as loss weights only (Strategy 1: hover-weighted)
+  use_hover: true
+  hover_bnd_sigma: 2.0
+  hover_mask_sigma: 1.5
+  hover_bnd_weight: 2.0
+  hover_in_weight: 0.5
+
+  # high-pass guidance（关键：你目前“仍平滑”最该挑战的就是这里）
+  hover_hp_sigma: 1.1
+  lambda_hover_hp_bnd: 0.60
+  lambda_hover_hp_mask: 0.30
+
+  # nucleus interior extra L1（让细胞内部不要只学成 bicubic）
+  lambda_mask_l1: 0.40
+
+  # small FFT HF loss (Strategy 3; 少量即可，避免噪声锐化)
+  lambda_fft: 0.03
+  fft_hf_ratio: 0.32
 
 
 # -----------------------
 # Trainer settings
 # -----------------------
 trainer:
-  epochs: 80
-  batch_size: 4
+  # 你现在卡在 0.22 附近，通常需要更长的退火+更强细节项才能走出来
+  epochs: 50
+
+  # crop 更大 + crops_per_img=2：建议降 batch
+  batch_size: 8
+
+  # 稍微提高 lr 帮你跳出 “SR≈LR_up” 局部最优
   lr: 2.0e-4
   weight_decay: 1.0e-4
   grad_clip: 1.0

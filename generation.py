@@ -38,7 +38,7 @@ from typing import Dict, Any, Tuple, Optional
 import torch
 from PIL import Image
 
-from model import SRModel, SRModelConfig
+from src.model import SRModel, SRModelConfig
 
 
 # ----------------------
@@ -293,7 +293,7 @@ def run_single_sr(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default="config.yml", help="Path to config.yml")
-    ap.add_argument("--ckpt", type=str, default="/workspace/SPR_new/logs/INR_SR_Scheme2_V21_20260128_122200/best_model.pt", help="Path to trained weights (best_model.pt or checkpoint_latest.pt)")
+    ap.add_argument("--ckpt", type=str, default="/workspace/SPR_new/logs/INR_SR_Scheme2_V22_20260129_020811/best_model.pt", help="Path to trained weights (best_model.pt or checkpoint_latest.pt)")
     ap.add_argument("--slide_id", type=str,default="TCGA-B8-4151-01Z-00-DX1")
     ap.add_argument("--n", type=int, default=263, help="Patch index, e.g. 1 -> patch_000001.png")
     ap.add_argument("--save_dir", type=str, default="/workspace/SPR_new/sr_png_single", help="Output root dir. Default: <out_img_dir>/sr_png_single")

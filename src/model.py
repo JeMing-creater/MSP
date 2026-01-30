@@ -44,11 +44,39 @@ def _hr_int_to_hr_norm(hr_xy_int: torch.Tensor, H: int, W: int) -> torch.Tensor:
 
 
 def _fuse_keep_color(lr_up: torch.Tensor, sr_pred: torch.Tensor) -> torch.Tensor:
-    # keep stain/color stable: only replace luminance residual
-    lr_g = _rgb_to_gray(lr_up)
-    sr_g = _rgb_to_gray(sr_pred)
-    delta = sr_g - lr_g
-    return (lr_up + delta.repeat(1, 3, 1, 1)).clamp(0, 1)
+    """
+    Texture-friendly stain stabilization.
+
+    Old behavior: enforce LR_up chroma by only injecting luminance residual -> tends to suppress cross-channel texture.
+    New behavior: match SR's global per-channel mean/std to LR_up (stain distribution),
+                  while keeping SR local texture/edges; then blend slightly for stability.
+
+    Notes:
+    - No extra deps.
+    - Inference-only postprocess; does NOT affect training gradients if used after clamp.
+    """
+    eps = 1e-6
+
+    # ensure float
+    lr = lr_up.to(dtype=torch.float32)
+    sr = sr_pred.to(dtype=torch.float32)
+
+    # per-sample, per-channel global stats (B,C,1,1)
+    lr_mean = lr.mean(dim=(2, 3), keepdim=True)
+    lr_std = lr.std(dim=(2, 3), keepdim=True).clamp_min(eps)
+
+    sr_mean = sr.mean(dim=(2, 3), keepdim=True)
+    sr_std = sr.std(dim=(2, 3), keepdim=True).clamp_min(eps)
+
+    # match SR distribution to LR distribution (global stain correction only)
+    sr_match = (sr - sr_mean) / sr_std * lr_std + lr_mean
+
+    # blend: keep SR texture dominant, only lightly correct stain distribution
+    alpha = 0.85  # 0.8~0.9 usually good; higher => more SR texture, lower => more stain stabilization
+    out = alpha * sr + (1.0 - alpha) * sr_match
+
+    return out.clamp(0.0, 1.0)
+
 
 
 def _blur01(m: torch.Tensor, sigma: float) -> torch.Tensor:
