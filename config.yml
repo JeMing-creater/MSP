@@ -1,5 +1,5 @@
 # 用于日志目录命名：logs/<checkpoint>_<timestamp>/
-checkpoint: "INR_SR_Scheme2_V15"
+checkpoint: "INR_SR_Scheme2_V24"
 
 # -----------------------
 # Dataset roots (for CLAM slicing/export)
@@ -55,118 +55,73 @@ data_loader:
 # train.py 会用这些超参构建 SRModelConfig / SRModel
 # -----------------------
 model:
-  # =====================================================
-  # Basic SR & kernel prediction
-  # =====================================================
   scale: 4
 
   feat_ch: 64
   pe_bands: 10
   mlp_hidden: 256
   mlp_depth: 5
-
-  kernel_size: 7
-  kernel_allow_negative: true
-
-  # =====================================================
-  # Multi-head dynamic kernel (S4)
-  # =====================================================
   kernel_heads: 4
-  kernel_gate_tau: 1.0
+  kernel_size: 7
+  kernel_allow_negative: false
   kernel_logit_norm: true
 
-  # =====================================================
-  # Training sampling
-  # =====================================================
-  num_points: 4096
-  saliency_ratio: 0.7
-  loss_alpha: 3.0
+  use_refiner: true
+  refiner_base: 64
+  refiner_depth: 5
 
-  # =====================================================
-  # Residual SR
-  # =====================================================
-  use_residual: true
-  use_res_refiner: true
-
-  # =====================================================
-  # Gradient consistency (base)
-  # =====================================================
-  lambda_grad: 0.1
-  grad_crop: 128
-
-  # =====================================================
-  # Inference chunking
-  # =====================================================
   infer_chunk: 8192
 
-  # =====================================================
-  # Tau annealing (kernel softmax temperature)
-  # =====================================================
+  # tau：拉长退火，别太快变“硬选择”
   tau_start: 1.0
-  tau_end: 0.5
-  tau_warm_epochs: 2
-  tau_anneal_epochs: 8
+  tau_end: 0.6
+  tau_warm_epochs: 3
+  tau_anneal_epochs: 20
 
-  # =====================================================
-  # HoVer-Net maps (used in loss & sampling)
-  # =====================================================
+  # gate：别从 8.0 太激进地下来（你原来是 8->1, 500/3000）
+  kernel_gate_tau_start: 4.0
+  kernel_gate_tau_end: 1.2
+  kernel_gate_tau_warm_steps: 1500
+  kernel_gate_tau_anneal_steps: 12000
+
+  # Strategy 1：更强的 dense crop
+  train_crop: 320
+  train_crops_per_img: 2
+  train_crop_chunk: 3072
+  lambda_crop_l1: 1.0
+
+  # hover 只做“训练期加权”，推理不依赖
   use_hover: true
-
-  hover_sample_ratio: 0.5
-  hover_bnd_sigma: 2.0
-  hover_mask_sigma: 1.5   # NOTE: 原来 hover_in_sigma 改为这个
-
+  hover_bnd_sigma: 1.8
+  hover_mask_sigma: 1.3
   hover_bnd_weight: 2.0
-  hover_in_weight: 0.5
+  hover_in_weight: 0.7
 
-  lambda_hover_grad: 0.2
-  lambda_in_gray: 0.05
+  # 关键：把“边界高频”稍微再拉高一点，但别太夸张
+  hover_hp_sigma: 1.0
+  lambda_hover_hp_bnd: 1.00
+  lambda_hover_hp_mask: 0.35
 
-  in_gray_crop: 192
+  # 细胞内部别学成 bicubic
+  lambda_mask_l1: 0.65
 
-  # =====================================================
-  # HoVer condition injection (TRAIN ONLY)
-  # =====================================================
-  use_hover_cond: true
-  hover_cond_bnd: true
-  hover_cond_mask: true
-
-  hover_cond_strength: 1.0
-  hover_cond_blur_lr: 0.0
-
-  hover_cond_dropout: 0.5
-
-  # =====================================================
-  # Teacher–Student consistency (EMA teacher + schedule)
-  # =====================================================
-  use_ema_teacher: true
-  ema_decay: 0.999
-  ema_update_every: 1
-
-  lambda_cond_consistency: 0.15
-  cond_consistency_crop: 192
-  cond_consistency_hp_sigma: 1.5
-
-  distill_warmup_epochs: 10
-  distill_ramp_epochs: 10
-
-  # =====================================================
-  # Diagnostics (optional)
-  # =====================================================
-  diag_kernel_points: 256
+  # FFT：少量即可（你也不想太重）
+  lambda_fft: 0.05
+  fft_hf_ratio: 0.28
 
 
 # -----------------------
 # Trainer settings
 # -----------------------
 trainer:
-  epochs: 50
-  batch_size: 8
-  lr: 1.0e-4
+  epochs: 120
+  batch_size: 4
+  lr: 3.0e-4
   weight_decay: 1.0e-4
   grad_clip: 1.0
   log_every: 50
   use_amp: true
+
 
 # -----------------------
 # Validation / checkpoint / visualization
