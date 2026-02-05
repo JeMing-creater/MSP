@@ -293,9 +293,9 @@ def run_single_sr(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default="config.yml", help="Path to config.yml")
-    ap.add_argument("--ckpt", type=str, default="/workspace/SPR_new/logs/INR_SR_Scheme2_V22_20260129_020811/best_model.pt", help="Path to trained weights (best_model.pt or checkpoint_latest.pt)")
-    ap.add_argument("--slide_id", type=str,default="TCGA-B8-4151-01Z-00-DX1")
-    ap.add_argument("--n", type=int, default=263, help="Patch index, e.g. 1 -> patch_000001.png")
+    ap.add_argument("--ckpt", type=str, default="/workspace/SPR_new/logs/INR_SR_Scheme2_V23_20260130_024205/best_model.pt", help="Path to trained weights (best_model.pt or checkpoint_latest.pt)")
+    ap.add_argument("--slide_id", type=str,default="TCGA-49-4505-01Z-00-DX4")
+    ap.add_argument("--n", type=int, default=240, help="Patch index, e.g. 1 -> patch_000001.png")
     ap.add_argument("--save_dir", type=str, default="/workspace/SPR_new/sr_png_single", help="Output root dir. Default: <out_img_dir>/sr_png_single")
     ap.add_argument("--device", type=str, default="cuda", help="cuda | cuda:0 | cpu")
     ap.add_argument("--amp", action="store_true", help="Use autocast fp16 on CUDA")

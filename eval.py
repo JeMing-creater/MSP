@@ -13,8 +13,7 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
-# --- your project imports ---
-from src.sr_diffusion_trainer import SRTrainConfig, DiffusionSRControlNetTrainer
+
 
 
 # -----------------------------
@@ -74,84 +73,92 @@ def build_loaders_by_hparams(
         pin_memory=pin_memory,
         drop_last=drop_last,
         require_done=require_done,
-        shuffle_train=shuffle_train,
-        disc_root=disc_root,
+        shuffle_train=shuffle_train
     )
 
 
-# -----------------------------
-# Checkpoint helpers
-# -----------------------------
-def load_trainer_for_ours(
-    cfg: SRTrainConfig,
-    ckpt_path: str,
-    device: str = "cuda",
-    strict: bool = False,
-) -> DiffusionSRControlNetTrainer:
-    """
-    Follow main.py-like flow: instantiate trainer, then load weights.
-    """
-    cfg.device = device
-    trainer = DiffusionSRControlNetTrainer(cfg, token=getattr(cfg, "token", None))
-    # your trainer should provide load_checkpoint
-    if hasattr(trainer, "load_checkpoint"):
-        trainer.load_checkpoint(ckpt_path, strict_full=strict)
-    else:
-        raise AttributeError("trainer has no load_checkpoint(). Please add/confirm it exists.")
-    return trainer
 
 
 # -----------------------------
 # Validation (match trainer.validate)
 # -----------------------------
 
-def make_infer_fn_ours(
-    trainer,
-    sample_steps: int = 20,
+
+def make_infer_fn_morph_isr(
+    morph_pack,
     do_color_cc: bool = True,
-    force_out_size: Optional[int] = 512,   # None: keep model output size
+    force_out_size: int | None = 512,
 ):
     """
-    Unified infer_fn signature:
-        sr = infer_fn(lr, hr, meta, device)
+    Build infer_fn for Morph-ISR.
 
-    - Works for validation (hr provided) and folder inference (hr may be None).
-    - Encapsulates ALL logic: sample_sr + optional color correction + optional resize.
+    IMPORTANT: infer_fn is made *signature-flexible* to match eval.py:
+      - sometimes called as infer_fn(lr, hr)
+      - sometimes called as infer_fn(lr, hr, meta, device)
+    See eval.py branching behavior :contentReference[oaicite:4]{index=4} and folder infer :contentReference[oaicite:5]{index=5}
     """
+    import torch
+    import torch.nn.functional as F
+
+    model = morph_pack["model"]
+    default_device = morph_pack.get("device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+    def _color_match_batch(sr: torch.Tensor, ref: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """
+        Simple per-image, per-channel affine color matching:
+            sr' = (sr - mu_sr) * (std_ref/std_sr) + mu_ref
+        ref is LR_up (bicubic), consistent with your eval.py color policy idea :contentReference[oaicite:6]{index=6}
+        """
+        # [B,3,H,W]
+        mu_s = sr.mean(dim=(-2, -1), keepdim=True)
+        mu_r = ref.mean(dim=(-2, -1), keepdim=True)
+        std_s = sr.var(dim=(-2, -1), keepdim=True, unbiased=False).sqrt().clamp_min(eps)
+        std_r = ref.var(dim=(-2, -1), keepdim=True, unbiased=False).sqrt().clamp_min(eps)
+        out = (sr - mu_s) * (std_r / std_s) + mu_r
+        return out
+
     @torch.no_grad()
-    def infer_fn(
-        lr: torch.Tensor,
-        hr: Optional[torch.Tensor],
-        meta: Dict[str, Any],
-        device: torch.device,
-    ) -> torch.Tensor:
+    def infer_fn(*args):
+        """
+        Accept both:
+          (lr, hr)
+          (lr, hr, meta, device)
+        """
+        if len(args) < 2:
+            raise TypeError("infer_fn expects at least (lr, hr)")
+        lr = args[0]
+        hr = args[1]
+        meta = args[2] if len(args) >= 3 else {}
+        device = args[3] if len(args) >= 4 else default_device
+
         lr = lr.to(device, non_blocking=True)
+        if hr is not None:
+            hr = hr.to(device, non_blocking=True)
 
-        steps = int(meta.get("sample_steps", sample_steps))
-
-        # 1) diffusion SR
-        sr = trainer.sample_sr(lr, num_steps=steps).clamp(0, 1)
-
-        # 2) determine target size for alignment
+        # target size policy (same as eval.py's make_infer_fn_ours) :contentReference[oaicite:7]{index=7}
         if hr is not None:
             target_hw = hr.shape[-2:]
         elif force_out_size is not None:
             target_hw = (int(force_out_size), int(force_out_size))
         else:
-            target_hw = sr.shape[-2:]
+            target_hw = None
 
-        # 3) resize SR if needed
-        if sr.shape[-2:] != target_hw:
+        # ---- Morph-ISR forward ----
+        # If your SRModel already outputs HR size, great; if not, we resize to target_hw.
+        sr = model(lr).clamp(0, 1)
+
+        if target_hw is not None and sr.shape[-2:] != target_hw:
             sr = F.interpolate(sr, size=target_hw, mode="bicubic", align_corners=False)
 
-        # 4) color correction (reference from LR_up only, consistent with your current policy)
-        if do_color_cc and hasattr(trainer, "_apply_color_correction_batch"):
+        # ---- optional color correction (reference from LR_up) ----
+        if do_color_cc and target_hw is not None:
             lr_up = F.interpolate(lr, size=target_hw, mode="bicubic", align_corners=False)
-            sr = trainer._apply_color_correction_batch(sr, lr_up).clamp(0, 1)
+            sr = _color_match_batch(sr, lr_up).clamp(0, 1)
 
         return sr
 
     return infer_fn
+
 
 
 @torch.no_grad()
@@ -534,29 +541,128 @@ def infer_folder_lr_to_sr_generic(
 # ----------models------------
 # load (model here)
 # ----------models------------
-def S3_Diff(OUT_ROOT, METHOD_NAME, OURS_OUTPUT_DIR, CKPT_PREFER, DEVICE, SAMPLE_STEPS, MAX_BATCHES):
-    # Important: cfg.output_dir controls where validate will write val_vis.
-    # If you don't want to pollute training folder, set a separate output_dir here.
-    
-    print("[main] resolving checkpoint ...")
-    ckpt_path = os.path.join(OURS_OUTPUT_DIR, CKPT_PREFER)
-    print(f"[main] ckpt: {ckpt_path}")
-    
-    cfg = SRTrainConfig()
-    cfg.output_dir = os.path.join(OUT_ROOT, "eval_runs", METHOD_NAME)  # redirect validate vis outputs
-    cfg.device = DEVICE
-    cfg.sample_steps = SAMPLE_STEPS
-    cfg.val_batches = MAX_BATCHES
-    cfg.val_vis_keep = 1  # keep minimal vis during eval (set 0 if you later modify validate to respect it)
+def Morph_ISR(
+    OUT_ROOT,
+    METHOD_NAME,
+    OURS_OUTPUT_DIR,
+    CKPT_PREFER,
+    DEVICE,
+    SAMPLE_STEPS,
+    MAX_BATCHES,
+    CONFIG_PATH: str | None = None,
+):
+    """
+    Morph-ISR loader (drop-in replacement for S3_Diff in eval.py):
+      1) build model using *train.py build_model_and_optim* style:
+         - load config.yml (eval.py is same level as train.py)
+         - take config.model
+         - force model_cfg["scale"] = config.data_loader.down_scale
+         - filter keys by SRModelConfig dataclass fields
+      2) load weights from best_model.pt / checkpoint_latest.pt (expects dict["model"])
+    """
+    import os
+    import glob
+    import yaml
+    import torch
+    import dataclasses
+    from easydict import EasyDict
 
-    ensure_dir(cfg.output_dir)
-    print(f"[main] eval output_dir (redirected): {cfg.output_dir}")
+    # -------------------------
+    # helper: cfg_get (same logic as train.py)
+    # -------------------------
+    def _cfg_get(cfg: EasyDict, path: str, default=None):
+        cur = cfg
+        for k in path.split("."):
+            if not hasattr(cur, k):
+                return default
+            cur = getattr(cur, k)
+        return cur
 
-    print("[main] loading trainer ...")
-    trainer = load_trainer_for_ours(cfg, ckpt_path, device=DEVICE, strict=False)
-    print("[main] trainer ready.")
-    return trainer
+    # -------------------------
+    # helper: resolve ckpt path
+    # -------------------------
+    def _resolve_ckpt_path(ckpt_dir: str, prefer: str) -> str:
+        # 1) direct path
+        if prefer=="best":
+            return ckpt_dir + "/" + "best_model.pt"
+        else:
+            return ckpt_dir + "/" + "checkpoint_latest.pt"
+        
+    # -------------------------
+    # 0) locate config.yml (eval.py same level as train.py)
+    # -------------------------
+    if CONFIG_PATH is not None:
+        cfg_path = CONFIG_PATH
+    else:
+        # eval.py file location (preferred)
+        try:
+            cfg_path = os.path.join(os.path.dirname(__file__), "config.yml")
+        except Exception:
+            cfg_path = "config.yml"  # fallback
 
+        if not os.path.isfile(cfg_path):
+            # fallback to cwd
+            cfg_path = os.path.join(os.getcwd(), "config.yml")
+
+    if not os.path.isfile(cfg_path):
+        raise FileNotFoundError(
+            f"[Morph_ISR] config.yml not found. Tried: {cfg_path}. "
+            f"Pass CONFIG_PATH explicitly."
+        )
+
+    config = EasyDict(yaml.load(open(cfg_path, "r", encoding="utf-8"), Loader=yaml.FullLoader))
+
+    # -------------------------
+    # 1) build model (train.py build_model_and_optim style)
+    # -------------------------
+    try:
+        from src.model import SRModel, SRModelConfig
+    except Exception:
+        from model import SRModel, SRModelConfig
+
+    valid_fields = {f.name for f in dataclasses.fields(SRModelConfig)}  # :contentReference[oaicite:3]{index=3}
+
+    model_cfg = {}
+    if hasattr(config, "model") and isinstance(config.model, (dict, EasyDict)):
+        model_cfg = dict(config.model)  # :contentReference[oaicite:4]{index=4}
+
+    # force scale from data_loader.down_scale (train.py behavior) :contentReference[oaicite:5]{index=5}
+    model_cfg["scale"] = int(_cfg_get(config, "data_loader.down_scale", 4))
+
+    filtered = {k: v for k, v in model_cfg.items() if k in valid_fields}  # :contentReference[oaicite:6]{index=6}
+
+    mcfg = SRModelConfig(**filtered)  # :contentReference[oaicite:7]{index=7}
+    model = SRModel(cfg=mcfg)
+
+    # -------------------------
+    # 2) load weights
+    # train.py best_model.pt: {"model": state_dict} :contentReference[oaicite:8]{index=8}
+    # train.py checkpoint_latest.pt: {"model": state_dict, ...} :contentReference[oaicite:9]{index=9}
+    # -------------------------
+    ckpt_path = _resolve_ckpt_path(OURS_OUTPUT_DIR, CKPT_PREFER)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    if not (isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict)):
+        raise RuntimeError(f"[Morph_ISR] Unexpected ckpt format (missing dict['model']): {ckpt_path}")
+
+    model.load_state_dict(ckpt["model"], strict=True)
+
+    device = torch.device(DEVICE)
+    model = model.to(device)
+    model.eval()
+
+    print(f"[Morph_ISR] cfg={cfg_path}", flush=True)
+    print(f"[Morph_ISR] ckpt={ckpt_path}", flush=True)
+
+    return {
+        "model": model,
+        "device": device,
+        "method_name": METHOD_NAME,
+        "sample_steps": int(SAMPLE_STEPS),
+        "max_batches": int(MAX_BATCHES),
+        "cfg_path": cfg_path,
+        "ckpt_path": ckpt_path,
+    }
 
 
 @torch.no_grad()
@@ -829,7 +935,7 @@ if __name__ == "__main__":
 
     # ours model
     # 说明：选择你训练好的OURS模型进行验证和推理
-    OURS_OUTPUT_DIR = "./outputs/sr_controlnet/checkpoints/"  # this is training output_dir that contains checkpoints/
+    OURS_OUTPUT_DIR = "/workspace/SPR_new/logs/INR_SR_Scheme2_V23_20260130_024205/"  # this is training output_dir that contains checkpoints/
     CKPT_PREFER = "best"  # "best" or "latest"
     DEVICE = "cuda"
 
@@ -842,7 +948,7 @@ if __name__ == "__main__":
     LR_FOLDER_TO_INFER = "/mnt/liangjm/SpRR_data/lr_png/TCGA-ZP-A9D4-01Z-00-DX1/"
     HR_FOLDER_TO_INFER = "/mnt/liangjm/SpRR_data/hr_png/TCGA-ZP-A9D4-01Z-00-DX1/"
     OUT_ROOT = "./output"  # will save to ./output/eval_image/{name}/{case_id}/
-    METHOD_NAME = "S3_Diff"
+    METHOD_NAME = "Morph-ISR"
 
     # # -------------------------
     # # 1) loaders
@@ -867,10 +973,13 @@ if __name__ == "__main__":
     # 2) load OURS trainer like main.py flow (init -> load weights)
     # -------------------------
     # 加载模型
-    S3_Diff = S3_Diff(OUT_ROOT, METHOD_NAME, OURS_OUTPUT_DIR, CKPT_PREFER, DEVICE, SAMPLE_STEPS, MAX_BATCHES)
-    # 构建输入输出函数。
-    infer_fn_ours = make_infer_fn_ours(S3_Diff, sample_steps=SAMPLE_STEPS, do_color_cc=True, force_out_size=512)
+    # S3_Diff = S3_Diff(OUT_ROOT, METHOD_NAME, OURS_OUTPUT_DIR, CKPT_PREFER, DEVICE, SAMPLE_STEPS, MAX_BATCHES)
+    # # 构建输入输出函数。
+    # infer_fn_ours = make_infer_fn_ours(S3_Diff, sample_steps=SAMPLE_STEPS, do_color_cc=True, force_out_size=512)
     
+    MorphPack = Morph_ISR(OUT_ROOT, METHOD_NAME, OURS_OUTPUT_DIR, CKPT_PREFER, DEVICE, SAMPLE_STEPS, MAX_BATCHES, CONFIG_PATH="config.yml")
+    infer_fn_ours = make_infer_fn_morph_isr(MorphPack, do_color_cc=True, force_out_size=512)
+
 
     # # -------------------------
     # # 3) validate on val/test (same logic as training validate)
